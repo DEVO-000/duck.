@@ -31,8 +31,8 @@ try:
 except ImportError:  # старое имя пакета
     from duckduckgo_search import DDGS
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВАШ_ТОКЕН")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "ВАШ_КЛЮЧ")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8476644074:AAGP_xfU_FzclMy4lprcPj9QBydATKWuU0s)
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-a7781a867460480b970bdd0c331fdd53)
 
 deepseek = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com", timeout=180.0)
 bot = Bot(token=TELEGRAM_TOKEN)
