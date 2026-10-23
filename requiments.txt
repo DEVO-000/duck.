@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+openai>=1.40,<2
+ddgs>=9.0,<10
+aiohttp>=3.9,<4
