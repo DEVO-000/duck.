@@ -1,14 +1,20 @@
 """
-Telegram-бот на DeepSeek: окно «Думаю Nс» в стиле Mira, доступ в интернет,
+Telegram-бот на DeepSeek: окно «Думаю Nс», доступ в интернет,
 история диалога, красивое HTML-форматирование.
+
+Токены берутся ТОЛЬКО из переменных окружения:
+    TELEGRAM_TOKEN
+    DEEPSEEK_API_KEY
 
 Установка:
     pip install -U aiogram openai aiohttp ddgs
 
-Запуск:
+Запуск локально:
     export TELEGRAM_TOKEN=...
     export DEEPSEEK_API_KEY=...
-    python bot_mira.py
+    python main.py
+
+На Render: добавить обе переменные в Environment → Save.
 """
 import asyncio
 import html
@@ -16,6 +22,7 @@ import json
 import os
 import random
 import re
+import sys
 import time
 from datetime import datetime
 
@@ -31,8 +38,20 @@ try:
 except ImportError:  # старое имя пакета
     from duckduckgo_search import DDGS
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8476644074:AAGP_xfU_FzclMy4lprcPj9QBydATKWuU0s)
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "sk-a7781a867460480b970bdd0c331fdd53)
+
+# ====================== ТОКЕНЫ (только из окружения) ======================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
+    print("❌ TELEGRAM_TOKEN не задан или имеет неверный формат.", file=sys.stderr)
+    print("   Укажите переменную окружения TELEGRAM_TOKEN (токен от @BotFather).", file=sys.stderr)
+    sys.exit(1)
+
+if not DEEPSEEK_API_KEY:
+    print("❌ DEEPSEEK_API_KEY не задан.", file=sys.stderr)
+    print("   Укажите переменную окружения DEEPSEEK_API_KEY.", file=sys.stderr)
+    sys.exit(1)
 
 deepseek = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com", timeout=180.0)
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -40,16 +59,15 @@ dp = Dispatcher()
 
 # ====================== НАСТРОЙКИ ======================
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-STATUS_LINES = 5          # высота окна под заголовком (фиксированная)
-STATUS_WIDTH = 38         # ширина строки
-STATUS_INTERVAL = 0.45    # частота обновления анимации
-ANSWER_INTERVAL = 0.35    # частота обновления черновика ответа
-HISTORY_LIMIT = 12        # сообщений в памяти диалога
-MAX_SEARCH_ROUNDS = 3     # сколько раз модель может искать за один вопрос
+STATUS_LINES = 5
+STATUS_WIDTH = 38
+STATUS_INTERVAL = 0.45
+ANSWER_INTERVAL = 0.35
+HISTORY_LIMIT = 12
+MAX_SEARCH_ROUNDS = 3
 
-# состояние по пользователям
 REASONING: dict[int, bool] = {}
-SEARCH: dict[int, bool] = {}          # по умолчанию интернет ВКЛ
+SEARCH: dict[int, bool] = {}
 HISTORY: dict[int, list[dict]] = {}
 LOCKS: dict[int, asyncio.Lock] = {}
 
@@ -62,7 +80,7 @@ def utf16_len(s: str) -> int:
 def wrap(text: str, width: int) -> list[str]:
     words, lines, cur = text.split(" "), [], ""
     for w in words:
-        while len(w) > width:  # длинные слова/ссылки режем
+        while len(w) > width:
             if cur:
                 lines.append(cur)
                 cur = ""
@@ -78,9 +96,8 @@ def wrap(text: str, width: int) -> list[str]:
     return lines
 
 
-# ====================== ОКНО «ДУМАЮ» (как в Mira) ======================
+# ====================== ОКНО «ДУМАЮ» ======================
 def render_status(title: str, secs: int, frame: int, text: str) -> tuple[str, list[MessageEntity]]:
-    """Заголовок «⠋ Думаю 12с» + цитата ровно из STATUS_LINES строк."""
     header = f"{SPINNER[frame % len(SPINNER)]} {title} {secs}с"
     lines: list[str] = []
     for ln in text.splitlines():
@@ -160,7 +177,6 @@ async def open_url(url: str) -> str:
 
 # ====================== HTML-ФОРМАТИРОВАНИЕ ======================
 def format_html(text: str) -> str:
-    """Код вынимаем первым, остальное экранируем — спецсимволы не ломают разметку."""
     stash: list[str] = []
 
     def put(block: str) -> str:
@@ -175,7 +191,7 @@ def format_html(text: str) -> str:
         return put(f"<pre>{safe}</pre>")
 
     text = re.sub(r"```(\w*)\n([\s\S]*?)```", code_block, text)
-    text = re.sub(r"```(\w*)\n?([\s\S]*)$", code_block, text)          # незакрытый блок
+    text = re.sub(r"```(\w*)\n?([\s\S]*)$", code_block, text)
     text = re.sub(r"`([^`\n]+)`", lambda m: put(f"<code>{html.escape(m.group(1))}</code>"), text)
 
     text = html.escape(text)
@@ -254,7 +270,6 @@ async def cmd_clear(m: types.Message):
 
 # ====================== ПОИСКОВАЯ ФАЗА ======================
 async def run_search_phase(history: list[dict], user_text: str, ui: dict) -> tuple[str, list[dict]]:
-    """Модель сама решает, искать ли. Возвращает (контекст для ответа, список источников)."""
     sources: list[dict] = []
     ctx_parts: list[str] = []
     today = datetime.now().strftime("%d.%m.%Y")
@@ -353,7 +368,6 @@ async def process(message: types.Message, uid: int):
     use_search = SEARCH.get(uid, True)
     history = HISTORY.setdefault(uid, [])
 
-    # ---- состояние анимации ----
     ui = {"phase": None, "text": "", "frame": 0, "t0": time.monotonic()}
     think_secs = 0
 
@@ -376,7 +390,6 @@ async def process(message: types.Message, uid: int):
 
     anim_task = asyncio.create_task(animate()) if ui["phase"] else None
 
-    # ---- 1) поиск ----
     search_ctx, sources = "", []
     if use_search:
         search_ctx, sources = await run_search_phase(history, user_text, ui)
@@ -384,7 +397,6 @@ async def process(message: types.Message, uid: int):
         ui["t0"] = time.monotonic()
         ui["text"] = ""
 
-    # ---- 2) ответ ----
     today = datetime.now().strftime("%d.%m.%Y")
     system = (
         f"Ты — умный дружелюбный ассистент. Сегодня {today}. Отвечай по существу и кратко, на языке пользователя. "
@@ -428,7 +440,7 @@ async def process(message: types.Message, uid: int):
             if d:
                 if not answer:
                     think_secs = int(time.monotonic() - ui["t0"]) if use_reasoning else 0
-                    ui["phase"] = "write"  # закрываем анимацию
+                    ui["phase"] = "write"
                 answer += d
 
                 now = time.monotonic()
@@ -456,7 +468,6 @@ async def process(message: types.Message, uid: int):
             except Exception:
                 pass
 
-    # ---- 3) финальное сообщение ----
     if not answer:
         await message.answer("🤷 Модель не вернула текст.", reply_markup=keyboard(uid))
         return
@@ -466,12 +477,10 @@ async def process(message: types.Message, uid: int):
 
     final = format_html(answer)
 
-    # сворачиваемый блок «Думал Nс»
     if use_reasoning and reasoning_text.strip():
         snippet = html.escape(reasoning_text.strip()[-1500:])
         final = (f"<blockquote expandable><b>🧠 Думал {think_secs}с</b>\n{snippet}</blockquote>\n\n" + final)
 
-    # источники
     if sources:
         seen, links = set(), []
         for i, s in enumerate(sources, 1):
