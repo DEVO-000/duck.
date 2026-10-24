@@ -37,5 +37,7 @@ services:
         sync: false
       - key: SYSTEM_PROMPT
         sync: false
+      # WEB_TOOLS=0 — выключить веб-поиск (по умолчанию включен: модель ищет в интернете)
+      # FONT=rich|mono|plain — вид ответов (в Telegram: /font)
       - key: MAX_HISTORY
         value: "24"

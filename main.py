@@ -3,6 +3,16 @@
 """
 TG AI Bot — Telegram-бот с подключаемыми AI-провайдерами (как в opencode).
 
+Умеет:
+    • стриминг ответов с анимацией «⌛ Думаю · 7с» и живыми статусами
+      (Ищу в интернете / Читаю страницу), ответы оформляются markdown → HTML
+      (или моноширинным «терминалом» — /font);
+    • ПРИНИМАЕТ ФОТО (vision) и файлы (код, txt, csv, json…) — модель видит их
+      содержимое; история хранит маркеры вместо тяжёлых медиа;
+    • веб-инструменты web_search (DuckDuckGo) и read_url с автоматическим
+      tool-calling во всех трёх протоколах (до 4 раундов); провайдеры без
+      поддержки tools отключаются автоматически; /web — вкл/выкл.
+
 Локально (long polling, сервер не нужен):
     pip install aiohttp
     BOT_TOKEN=123:ABC python main.py      # или просто python main.py — спросит токен
@@ -24,6 +34,8 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
     DEFAULT_MODEL        модель по умолчанию, напр. deepseek-chat или openai/gpt-4o-mini
     DEFAULT_PROVIDER     имя провайдера для дефолта (иначе первый PROVIDER_N)
     SYSTEM_PROMPT / MAX_HISTORY / ADMIN_ONLY — применяются при каждом старте
+    WEB_TOOLS            0 = выключить веб-поиск по умолчанию (вкл: 1)
+    FONT                 вид ответов по умолчанию: rich | mono | plain
     Render сам задает PORT и RENDER_EXTERNAL_URL — бот поднимет HTTP-сервер
     (health-check на "/") и зарегистрирует webhook.
 
@@ -36,6 +48,8 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
                  моделей с сервера; кнопка «🤖 Сменить модель» появляется
                  под каждым ответом — можно менять модель каждый раз)
     /providers — список провайдеров
+    /web       — веб-инструменты: поиск и чтение страниц
+    /font      — вид ответов: rich / mono / plain
     /help      — все команды
 
 Провайдеры хранятся в config.json, история диалогов — в state.json
@@ -51,7 +65,9 @@ webhook, если задан RENDER_EXTERNAL_URL / WEBHOOK_URL, иначе polli
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -59,7 +75,9 @@ import secrets
 import signal
 import sys
 import time
+from datetime import date
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 try:
     import aiohttp
@@ -87,6 +105,53 @@ MODELS_TTL = 300        # секунд кэша списка моделей
 EDIT_EVERY = 1.6        # интервал редактирования сообщения при стриминге
 MAX_TG = 4000           # безопасный лимит длины сообщения Telegram
 MAX_TOKENS_ANTHROPIC = 8192
+
+# --- медиа и инструменты ---
+MAX_MEDIA_BYTES = 10 * 1024 * 1024   # максимальный размер фото/файла
+MAX_FILE_TEXT = 15000                # максимальный размер текста из файла
+MAX_TOOL_ROUNDS = 4                  # раундов «модель → инструменты → модель»
+TG_FILE_BASE = "https://api.telegram.org/file/bot{token}/{path}"  # скачивание файлов
+UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
+TOOL_LABELS = {"web_search": "🌐 Ищу в интернете", "read_url": "📄 Читаю страницу"}
+
+TEXT_EXTS = {
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".log", ".json", ".xml", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".conf", ".env", ".py", ".pyw", ".js", ".mjs", ".ts", ".tsx",
+    ".jsx", ".java", ".kt", ".kts", ".c", ".h", ".cpp", ".hpp", ".cs", ".go", ".rs",
+    ".rb", ".php", ".lua", ".swift", ".m", ".sql", ".sh", ".bash", ".zsh", ".ps1",
+    ".html", ".htm", ".css", ".scss", ".vue", ".svelte", ".dart", ".r", ".ipynb",
+    ".dockerfile", ".gitignore", ".diff", ".patch", ".tex", ".srt", ".vtt",
+}
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+# инструменты (формат OpenAI; для других протоколов конвертируются)
+TOOLS_SPEC = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Поиск в интернете (DuckDuckGo). Возвращает заголовки, ссылки и сниппеты.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Поисковый запрос"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_url",
+            "description": "Открыть веб-страницу и получить её текст.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+            },
+        },
+    },
+]
 
 PROTOCOLS = ("openai", "anthropic", "gemini")
 PROTOCOL_TITLES = {
@@ -220,7 +285,9 @@ PRESETS: Dict[str, Dict[str, str]] = {
 HELP_TEXT = "\n".join([
     "👋 Я AI-бот с подключаемыми провайдерами (как в opencode).",
     "",
-    "💬 Просто напишите сообщение — я отвечу через выбранную модель.",
+    "💬 Просто напишите сообщение — отвечу через выбранную модель.",
+    "📷 Можно присылать фото (модель их увидит) и файлы: код, txt, csv, json…",
+    "🌐 Умею искать в интернете и открывать ссылки, если нужны свежие данные.",
     "",
     "Команды:",
     "/model — выбрать модель для этого чата",
@@ -234,6 +301,8 @@ HELP_TEXT = "\n".join([
     "/default — модель по умолчанию для новых чатов",
     "/key <id> <ключ> — сменить API-ключ провайдера",
     "/url <id> <url> — сменить baseURL провайдера",
+    "/web — вкл/выкл веб-инструменты (поиск и чтение страниц)",
+    "/font — вид ответов: форматированный / моноширинный / простой",
     "/sys <текст> — системный промпт (/sys off — выключить)",
     "/lock — переключить режим «только администраторы»",
     "/id — показать ID (чата и ваш)",
@@ -273,6 +342,8 @@ def default_config() -> Dict[str, Any]:
         "admins_only": False,    # True = общаться могут только администраторы
         "system_prompt": "",
         "max_history": 24,       # сообщений (пар) в истории на чат
+        "web_tools": True,       # веб-инструменты: поиск и чтение страниц
+        "font": "rich",          # вид ответов: rich | mono | plain
         "default": {"provider": "", "model": ""},
         "providers": {},         # pid -> {name, protocol, base_url, api_key, enabled}
     }
@@ -335,6 +406,17 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> None:
     elif ao in ("0", "false", "no"):
         cfg["admins_only"] = False
         applied.append("ADMIN_ONLY=0")
+    wt = os.environ.get("WEB_TOOLS", "").strip().lower()
+    if wt in ("1", "true", "yes"):
+        cfg["web_tools"] = True
+        applied.append("WEB_TOOLS=1")
+    elif wt in ("0", "false", "no"):
+        cfg["web_tools"] = False
+        applied.append("WEB_TOOLS=0")
+    ft = os.environ.get("FONT", "").strip().lower()
+    if ft in ("rich", "mono", "plain"):
+        cfg["font"] = ft
+        applied.append(f"FONT={ft}")
     if applied:
         print("Из окружения применены: " + ", ".join(applied))
 
@@ -634,17 +716,84 @@ async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any
     return out
 
 
+# --- конвертация контента и инструментов под протоколы ---
+
+def _tools_for(proto: str) -> List[Dict[str, Any]]:
+    if proto == "anthropic":
+        return [{"name": t["function"]["name"],
+                 "description": t["function"]["description"],
+                 "input_schema": t["function"]["parameters"]} for t in TOOLS_SPEC]
+    if proto == "gemini":
+        return [{"functionDeclarations": [
+            {"name": t["function"]["name"],
+             "description": t["function"]["description"],
+             "parameters": t["function"]["parameters"]} for t in TOOLS_SPEC]}]
+    return TOOLS_SPEC
+
+
+def _safe_json(s: str) -> Dict[str, Any]:
+    try:
+        obj = json.loads(s or "{}")
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _openai_content(c: Any) -> Any:
+    if isinstance(c, str):
+        return c
+    out: List[Dict[str, Any]] = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"type": "image_url",
+                        "image_url": {"url": f"data:{p.get('media_type', 'image/jpeg')};base64,{p.get('data', '')}"}})
+    return out
+
+
+def _anth_content(c: Any) -> List[Dict[str, Any]]:
+    if isinstance(c, str):
+        return [{"type": "text", "text": c}]
+    out: List[Dict[str, Any]] = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"type": "image", "source": {"type": "base64",
+                                                    "media_type": p.get("media_type", "image/jpeg"),
+                                                    "data": p.get("data", "")}})
+    return out
+
+
+def _gem_parts(c: Any) -> List[Dict[str, Any]]:
+    if isinstance(c, str):
+        return [{"text": c}]
+    out: List[Dict[str, Any]] = []
+    for p in c:
+        if p.get("type") == "text":
+            out.append({"text": p.get("text", "")})
+        elif p.get("type") == "image":
+            out.append({"inline_data": {"mime_type": p.get("media_type", "image/jpeg"),
+                                        "data": p.get("data", "")}})
+    return out
+
+
 async def stream_chat(
     session: "aiohttp.ClientSession",
     provider: Dict[str, Any],
     model: str,
-    messages: List[Dict[str, str]],
-) -> AsyncGenerator[str, None]:
-    """Стриминг ответа модели: отдаёт кусочки текста (deltas)."""
+    messages: List[Dict[str, Any]],
+    tools: bool = False,
+) -> AsyncGenerator[Tuple[str, Any], None]:
+    """Стриминг ответа модели. Отдаёт события-кортежи:
+       ("text", "кусочек") и, если модель вызвала инструменты,
+       ("tools", [{"id", "name", "args"}]) в конце раунда."""
     proto = provider["protocol"]
     base = provider["base_url"].rstrip("/")
     key = provider.get("api_key", "")
-    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    system = "\n\n".join(m["content"] for m in messages
+                         if m["role"] == "system" and isinstance(m.get("content"), str))
     rest = [m for m in messages if m["role"] != "system"]
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
@@ -659,40 +808,101 @@ async def stream_chat(
         if "openrouter.ai" in base:
             headers["HTTP-Referer"] = "https://github.com/tg-ai-bot"
             headers["X-Title"] = "TG AI Bot"
-        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+        msgs: List[Dict[str, Any]] = []
+        for m in rest:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                msgs.append({
+                    "role": "assistant",
+                    "content": m.get("content") or None,
+                    "tool_calls": [{"id": c["id"], "type": "function",
+                                    "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                                   for c in m["tool_calls"]],
+                })
+            elif m["role"] == "tool":
+                msgs.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]})
+            else:
+                msgs.append({"role": m["role"], "content": _openai_content(m["content"])})
+        payload: Dict[str, Any] = {"model": model, "messages": msgs, "stream": True}
+        if tools:
+            payload["tools"] = _tools_for(proto)
     elif proto == "anthropic":
         url = f"{base}/v1/messages"
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
         if key:
             headers["x-api-key"] = key
-        payload = {
-            "model": model,
-            "max_tokens": MAX_TOKENS_ANTHROPIC,
-            "messages": [{"role": m["role"], "content": m["content"]} for m in rest],
-            "stream": True,
-        }
-        if system:
-            payload["system"] = system
+        a_msgs: List[Dict[str, Any]] = []
+        pend: List[Dict[str, Any]] = []
+
+        def flush_tools() -> None:
+            if pend:
+                a_msgs.append({"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": t["tool_call_id"], "content": t["content"]}
+                    for t in pend]})
+                pend.clear()
+
+        for m in rest:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                flush_tools()
+                blocks: List[Dict[str, Any]] = []
+                if m.get("content"):
+                    blocks.append({"type": "text", "text": m["content"]})
+                for c in m["tool_calls"]:
+                    blocks.append({"type": "tool_use", "id": c["id"], "name": c["name"],
+                                   "input": _safe_json(c["args"])})
+                a_msgs.append({"role": "assistant", "content": blocks})
+            elif m["role"] == "tool":
+                pend.append(m)
+            else:
+                flush_tools()
+                a_msgs.append({"role": "user", "content": _anth_content(m["content"])})
+        flush_tools()
+        payload = {"model": model, "max_tokens": MAX_TOKENS_ANTHROPIC,
+                   "messages": a_msgs, "stream": True}
+        if tools:
+            payload["tools"] = _tools_for(proto)
     elif proto == "gemini":
         url = f"{base}/v1beta/models/{model}:streamGenerateContent?alt=sse"
         if key:
             url += f"&key={key}"
         headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [
-                {
-                    "role": "model" if m["role"] == "assistant" else "user",
-                    "parts": [{"text": m["content"]}],
-                }
-                for m in rest
-            ]
-        }
+        g_msgs: List[Dict[str, Any]] = []
+        pend_g: List[Dict[str, Any]] = []
+
+        def flush_tools_g() -> None:
+            if pend_g:
+                g_msgs.append({"role": "function", "parts": [
+                    {"functionResponse": {"name": t["name"], "response": {"result": t["content"]}}}
+                    for t in pend_g]})
+                pend_g.clear()
+
+        for m in rest:
+            if m["role"] == "assistant" and m.get("tool_calls"):
+                flush_tools_g()
+                parts: List[Dict[str, Any]] = []
+                if m.get("content"):
+                    parts.append({"text": m["content"]})
+                for c in m["tool_calls"]:
+                    parts.append({"functionCall": {"name": c["name"], "args": _safe_json(c["args"])}})
+                g_msgs.append({"role": "model", "parts": parts})
+            elif m["role"] == "tool":
+                pend_g.append(m)
+            else:
+                flush_tools_g()
+                g_msgs.append({"role": "user", "parts": _gem_parts(m["content"])})
+        flush_tools_g()
+        payload = {"contents": g_msgs}
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            payload["tools"] = _tools_for(proto)
     else:
         raise ProviderError(f"Неизвестный протокол: {proto}")
 
     resp: Optional[aiohttp.ClientResponse] = None
+    oa_calls: Dict[int, Dict[str, str]] = {}
+    anth_calls: List[Dict[str, str]] = []
+    anth_cur: Optional[Dict[str, str]] = None
+    gem_calls: List[Dict[str, str]] = []
     try:
         if proto == "openai":
             for i, u in enumerate(urls):
@@ -720,27 +930,190 @@ async def stream_chat(
 
                 if proto == "openai":
                     choices = obj.get("choices") or [{}]
-                    delta = (choices[0].get("delta") or {}).get("content")
-                    if delta:
-                        yield delta
+                    delta = choices[0].get("delta") or {}
+                    if delta.get("content"):
+                        yield ("text", delta["content"])
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index")
+                        idx = len(oa_calls) if idx is None else int(idx)
+                        c = oa_calls.setdefault(idx, {"id": "", "name": "", "args": ""})
+                        if tc.get("id"):
+                            c["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            c["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            c["args"] += fn["arguments"]
                 elif proto == "anthropic":
                     t = obj.get("type")
-                    if t == "content_block_delta":
+                    if t == "content_block_start":
+                        b = obj.get("content_block") or {}
+                        if b.get("type") == "tool_use":
+                            anth_cur = {"id": b.get("id", ""), "name": b.get("name", ""), "args": ""}
+                    elif t == "content_block_delta":
                         d = obj.get("delta") or {}
-                        piece = d.get("text") or d.get("partial_json")
-                        if piece:
-                            yield piece
+                        if d.get("type") == "input_json_delta" and anth_cur is not None:
+                            anth_cur["args"] += d.get("partial_json") or ""
+                        elif d.get("type") in (None, "text_delta") and d.get("text"):
+                            yield ("text", d["text"])
+                    elif t == "content_block_stop":
+                        if anth_cur is not None:
+                            anth_calls.append(anth_cur)
+                            anth_cur = None
                     elif t == "error":
                         raise ProviderError(json.dumps(obj.get("error"), ensure_ascii=False)[:300])
                 else:  # gemini
                     for cand in obj.get("candidates") or []:
                         for part in ((cand.get("content") or {}).get("parts") or []):
-                            piece = part.get("text")
-                            if piece:
-                                yield piece
+                            if part.get("text"):
+                                yield ("text", part["text"])
+                            if part.get("functionCall"):
+                                fc = part["functionCall"]
+                                gem_calls.append({"id": f"call{len(gem_calls)}",
+                                                  "name": fc.get("name", ""),
+                                                  "args": json.dumps(fc.get("args") or {}, ensure_ascii=False)})
+
+        if proto == "openai" and oa_calls:
+            yield ("tools", [{"id": c["id"] or f"call{i}", "name": c["name"], "args": c["args"] or "{}"}
+                             for i, c in sorted(oa_calls.items())])
+        elif proto == "anthropic" and anth_calls:
+            yield ("tools", anth_calls)
+        elif proto == "gemini" and gem_calls:
+            yield ("tools", gem_calls)
     finally:
         if resp is not None and not resp.closed:
             resp.close()
+
+
+# --- веб-инструменты (web_search / read_url) ---
+
+def _clean_html(s: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+async def web_search(session: "aiohttp.ClientSession", query: str, limit: int = 6) -> str:
+    try:
+        async with session.get("https://html.duckduckgo.com/html/",
+                               params={"q": query, "kl": "ru-ru"},
+                               headers=UA,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            page = await r.text(errors="ignore")
+    except Exception as e:  # noqa: BLE001
+        return f"Ошибка поиска: {e}"
+    links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+    out = []
+    for i, (href, title) in enumerate(links[:limit]):
+        m = re.search(r"uddg=([^&]+)", href)
+        url = unquote(m.group(1)) if m else href
+        snip = _clean_html(snippets[i]) if i < len(snippets) else ""
+        out.append(f"{i + 1}. {_clean_html(title)}\n{url}\n{snip}")
+    return "\n\n".join(out) or "Ничего не найдено."
+
+
+async def read_url(session: "aiohttp.ClientSession", url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        return "Неверная ссылка."
+    try:
+        async with session.get(url, headers=UA,
+                               timeout=aiohttp.ClientTimeout(total=15)) as r:
+            page = await r.text(errors="ignore")
+    except Exception as e:  # noqa: BLE001
+        return f"Не удалось открыть: {e}"
+    page = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav).*?</\1>", " ", page)
+    text = _clean_html(re.sub(r"(?s)<[^>]+>", " ", page))
+    text = re.sub(r"\s+", " ", text)
+    return text[:4000] or "Страница пустая."
+
+
+async def run_tool(session: Optional["aiohttp.ClientSession"], name: str, args_json: str) -> str:
+    args = _safe_json(args_json)
+    if name == "web_search":
+        return await web_search(session, args.get("query", ""))
+    if name == "read_url":
+        return await read_url(session, args.get("url", ""))
+    return "Неизвестный инструмент."
+
+
+def _is_tools_error(err: str) -> bool:
+    """Похоже ли на ошибку «провайдер не умеет tools/functions»."""
+    low = (err or "").lower()
+    mentions = any(m in low for m in ("tools", "tool_use", "function", "functioncall"))
+    broken = any(m in low for m in ("not support", "unsupported", "unknown", "unrecognized",
+                                    "invalid", "unexpected", "400"))
+    return mentions and broken
+
+
+# --- оформление ответов ---
+
+def md_to_html(text: str) -> str:
+    """Markdown → Telegram HTML: **жирный**, *курсив*, `код`, ```блоки```, # заголовки."""
+    text = html.escape(text, quote=False)
+    text = re.sub(r"```(\w*)\n?(.*?)```",
+                  lambda m: f'<pre><code class="language-{m.group(1)}">{m.group(2)}</code></pre>'
+                  if m.group(1) else f"<pre><code>{m.group(2)}</code></pre>",
+                  text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"(?<![\w*])\*([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"^#{1,4}\s+(.*)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+    return text
+
+
+def fmt_strict(text: str) -> str:
+    """Строгий моноширинный вид: без markdown, весь ответ <code>…</code>."""
+    text = re.sub(r"```\w*\n?", "", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"^#{1,4}\s+", "", text, flags=re.MULTILINE)
+    return f"<code>{html.escape(text.strip(), quote=False)}</code>"
+
+
+# --- анимация «Думаю · Nс» (как черновик из референса, но через editMessageText) ---
+
+class ThinkingTimer:
+    """Обновляет сообщение-статус раз в секунду: «⌛ Провайдер · Думаю\n7с».
+    Метки меняются во время работы инструментов (Ищу в интернете / Читаю страницу)."""
+
+    def __init__(self, app: "App", chat_id: int, message_id: int, provider_name: str) -> None:
+        self.app = app
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.provider = provider_name
+        self.label = "Думаю"
+        self.start = time.monotonic()
+        self.active = False
+        self.task: Optional[asyncio.Task] = None
+
+    async def _loop(self) -> None:
+        while self.active:
+            sec = int(time.monotonic() - self.start)
+            try:
+                await self.app.edit(self.chat_id, self.message_id,
+                                    f"⌛ {self.provider} · {self.label}\n{sec}с")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                raise
+
+    def run(self) -> None:
+        if not self.active:
+            self.active = True
+            self.start = time.monotonic()
+            self.task = asyncio.create_task(self._loop())
+
+    def set_label(self, label: str) -> None:
+        self.label = label
+        self.start = time.monotonic()
+
+    async def stop(self) -> None:
+        if self.active:
+            self.active = False
+            if self.task is not None:
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
+                self.task = None
 
 
 # ----------------------------------------------------------------------------
@@ -757,6 +1130,8 @@ class App:
         self.dialogs: Dict[int, Dict[str, Any]] = {}
         # кэш моделей: pid -> (timestamp, [(model_id, name)])
         self.models_cache: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
+        # провайдеры, у которых веб-инструменты выключены (не поддерживают tools)
+        self._no_tools: set = set()
         self._save_lock = asyncio.Lock()
 
     # ---------- persistence ----------
@@ -806,7 +1181,8 @@ class App:
                     await asyncio.sleep(delay)
         raise err  # type: ignore[misc]
 
-    async def send(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> Dict[str, Any]:
+    async def send(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None,
+                   parse_mode: Optional[str] = None) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text[:MAX_TG],
@@ -814,9 +1190,12 @@ class App:
         }
         if reply_markup:
             kwargs["reply_markup"] = reply_markup
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
         return await self.api("sendMessage", **kwargs)
 
-    async def edit(self, chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None) -> None:
+    async def edit(self, chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None,
+                   parse_mode: Optional[str] = None) -> None:
         kwargs: Dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": message_id,
@@ -825,6 +1204,8 @@ class App:
         }
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
         try:
             await self.api("editMessageText", **kwargs)
         except TgError as e:
@@ -905,6 +1286,77 @@ class App:
                 return None
         return pid, provider, mid
 
+    # ---------- фото и файлы ----------
+
+    async def download_tg_file(self, file_id: str, max_bytes: int = MAX_MEDIA_BYTES) -> Tuple[bytes, str]:
+        """Скачать файл с серверов Telegram: (bytes, mime по расширению)."""
+        f = await self.api("getFile", http_timeout=30, file_id=file_id)
+        path = (f or {}).get("file_path") or ""
+        ext = ("." + path.rsplit(".", 1)[-1].lower()) if "." in path else ""
+        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                    "webp": "image/webp", "gif": "image/gif", "pdf": "application/pdf",
+                    "mp3": "audio/mpeg", "ogg": "audio/ogg", "mp4": "video/mp4"}
+        mime = mime_map.get(ext.lstrip("."), "application/octet-stream")
+        url = TG_FILE_BASE.format(token=self.cfg["bot_token"], path=path)
+        assert self.session is not None
+        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status >= 400:
+                raise ProviderError(f"не удалось скачать файл: HTTP {r.status}")
+            data = await r.read()
+        if len(data) > max_bytes:
+            raise ProviderError(f"файл слишком большой ({len(data) // 1024 // 1024} МБ, лимит "
+                                f"{max_bytes // 1024 // 1024} МБ)")
+        return data, mime
+
+    async def extract_media(self, msg: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str, List[str]]:
+        """Фото и документы из сообщения → (картинки для vision, текст файлов, примечания).
+        Картинки: [{"type": "image", "media_type", "data"(base64)}]."""
+        images: List[Dict[str, str]] = []
+        files_text = ""
+        notes: List[str] = []
+
+        async def add_image(file_id: str, mime: str) -> None:
+            try:
+                data, m = await self.download_tg_file(file_id)
+                mime = mime if mime.startswith("image/") else m
+                images.append({"type": "image", "media_type": mime or m,
+                               "data": base64.b64encode(data).decode()})
+            except ProviderError as e:
+                notes.append(str(e))
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"не удалось скачать: {e}")
+
+        photo = msg.get("photo")
+        if photo:
+            best = max(photo, key=lambda p: p.get("width", 0) * p.get("height", 0))
+            await add_image(best.get("file_id", ""), "image/jpeg")
+
+        doc = msg.get("document")
+        if doc:
+            name = doc.get("file_name") or "file"
+            mime = (doc.get("mime_type") or "").lower()
+            ext = os.path.splitext(name)[1].lower()
+            if mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                await add_image(doc.get("file_id", ""), mime)
+            elif mime.startswith("text/") or mime in (
+                    "application/json", "application/xml", "application/javascript",
+                    "application/x-yaml", "application/toml", "application/x-sh") or ext in TEXT_EXTS:
+                try:
+                    data, _ = await self.download_tg_file(doc.get("file_id", ""))
+                except ProviderError as e:
+                    notes.append(str(e))
+                else:
+                    txt = data.decode("utf-8", "replace")
+                    if txt.count("\ufffd") > len(txt) * 0.3:
+                        notes.append(f"файл «{name}» двоичный — пришлите текстом")
+                    else:
+                        cut = " …(обрезано)" if len(txt) > MAX_FILE_TEXT else ""
+                        files_text += f"📎 Файл «{name}»:\n\n{txt[:MAX_FILE_TEXT]}{cut}\n\n"
+            else:
+                notes.append(f"файл «{name}» этого типа пока не поддерживается — "
+                             "пришлите текстом или скриншотом")
+        return images, files_text, notes
+
     # ---------- клавиатуры ----------
 
     @staticmethod
@@ -981,7 +1433,37 @@ class App:
             except asyncio.TimeoutError:
                 pass
 
-    async def generate_and_send(self, msg: Dict[str, Any], user_text: str) -> None:
+    async def send_final(self, chat_id: int, msg_id: int, text: str) -> None:
+        """Финальный ответ: оформление по /font + кнопка смены модели.
+        Длинные ответы разбиваются (без форматирования)."""
+        quick = self.kb([[("🤖 Сменить модель", "qmodel")]])
+        font = self.cfg.get("font", "rich")
+        html_text: Optional[str] = None
+        if font == "mono":
+            html_text = fmt_strict(text)
+        elif font == "rich":
+            html_text = md_to_html(text)
+        if html_text is not None and len(html_text) <= MAX_TG:
+            try:
+                await self.edit(chat_id, msg_id, html_text, quick, parse_mode="HTML")
+                return
+            except TgError:
+                pass  # не разобралась разметка → обычный текст ниже
+        if len(text) <= MAX_TG:
+            await self.edit(chat_id, msg_id, text, quick)
+        else:
+            chunks = []
+            rest = text
+            while rest:
+                chunks.append(rest[:MAX_TG])
+                rest = rest[MAX_TG:]
+            await self.edit(chat_id, msg_id, chunks[0], quick)
+            for c in chunks[1:]:
+                await self.send(chat_id, c)
+
+    async def generate_and_send(self, msg: Dict[str, Any], user_text: str,
+                                images: Optional[List[Dict[str, str]]] = None,
+                                files_text: str = "", marker: Optional[str] = None) -> None:
         chat_id = msg["chat"]["id"]
         resolved = self.resolve(chat_id)
         if not resolved:
@@ -993,68 +1475,112 @@ class App:
             return
         pid, provider, model_id = resolved
         display = self.model_display(pid, model_id)
+        images = images or []
 
         st = self.chat_state(chat_id)
-        history: List[Dict[str, str]] = st.get("history", [])
+        history: List[Dict[str, Any]] = st.get("history", [])
         max_hist = int(self.cfg.get("max_history", 24) or 24)
-        sys_prompt = self.cfg.get("system_prompt", "")
 
-        messages: List[Dict[str, str]] = []
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-        messages += history
-        messages.append({"role": "user", "content": user_text})
+        tools_on = bool(self.cfg.get("web_tools", True)) and pid not in self._no_tools
 
-        placeholder = await self.send(chat_id, f"⏳ {provider['name']} · {display}\nДумаю…")
+        def build_messages(with_tools: bool) -> List[Dict[str, Any]]:
+            sp = self.cfg.get("system_prompt", "")
+            if with_tools:
+                sp = (sp + "\n\n" if sp else "") + (
+                    "Если нужны свежие данные (новости, курсы, погода, события, факты, "
+                    "в которых не уверен) — используй web_search, а при необходимости "
+                    "read_url, чтобы открыть страницу. В конце коротко укажи источники ссылками.")
+            date_note = f"Сегодня {date.today().strftime('%d.%m.%Y')}."
+            sp = (sp + "\n\n" + date_note) if sp else date_note
+            content_text = ((files_text + "\n\n") if files_text else "") + user_text
+            user_content: Any = (
+                [{"type": "text", "text": content_text}] + images if images else content_text)
+            return [{"role": "system", "content": sp}] + history + \
+                [{"role": "user", "content": user_content}]
+
+        messages = build_messages(tools_on)
+
+        placeholder = await self.send(chat_id, f"⌛ {provider['name']} · {display}\nДумаю\n0с")
         msg_id = placeholder["message_id"]
+        timer = ThinkingTimer(self, chat_id, msg_id, provider["name"])
 
         stop = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(chat_id, stop))
         full = ""
-        buf = ""
-        last_edit = 0.0
         try:
-            async for delta in stream_chat(self.session, provider, model_id, messages):  # type: ignore[arg-type]
-                buf += delta
-                now = time.monotonic()
-                if now - last_edit >= EDIT_EVERY:
-                    full += buf
-                    buf = ""
-                    last_edit = now
-                    shown = (full + buf)[-MAX_TG:]
-                    try:
-                        await self.edit(chat_id, msg_id, shown + " ▌")
-                    except TgError:
-                        pass
-            full += buf
+            timer.run()
+            for attempt in (0, 1):
+                conv = list(messages)
+                full = ""
+                last_edit = 0.0
+                rounds = MAX_TOOL_ROUNDS if tools_on else 1
+                try:
+                    for _round in range(rounds):
+                        acc = ""
+                        calls: List[Dict[str, str]] = []
+                        async for kind, piece in stream_chat(self.session, provider, model_id, conv, tools=tools_on):  # type: ignore[arg-type]
+                            if kind == "tools":
+                                calls = piece
+                                continue
+                            acc += piece
+                            if timer.active:
+                                await timer.stop()
+                            now = time.monotonic()
+                            if now - last_edit >= EDIT_EVERY:
+                                last_edit = now
+                                try:
+                                    await self.edit(chat_id, msg_id, acc[-MAX_TG:] + " ▌")
+                                except TgError:
+                                    pass
+                        if not calls:
+                            full = acc
+                            break
+                        # модель вызвала инструменты — выполняем и идём на следующий раунд
+                        conv.append({"role": "assistant", "content": acc, "tool_calls": calls})
+                        for c in calls:
+                            timer.set_label(TOOL_LABELS.get(c["name"], "Работаю"))
+                            timer.run()
+                            result = await run_tool(self.session, c["name"], c["args"])
+                            conv.append({"role": "tool", "tool_call_id": c["id"],
+                                         "name": c["name"], "content": result})
+                        timer.set_label("Думаю")
+                        full = acc
+                    break
+                except ProviderError as e:
+                    if attempt == 0 and tools_on and _is_tools_error(str(e)):
+                        # провайдер не умеет инструменты — запоминаем и повторяем без них
+                        self._no_tools.add(pid)
+                        tools_on = False
+                        try:
+                            await self.edit(
+                                chat_id, msg_id,
+                                f"⚠️ {provider['name']} не поддерживает веб-инструменты.\n"
+                                "Продолжаю без поиска… (выключить совсем: /web off)")
+                        except TgError:
+                            pass
+                        await asyncio.sleep(1)
+                        continue
+                    raise
+            await timer.stop()
 
             if not full:
                 await self.edit(chat_id, msg_id, "⚠️ Пустой ответ от модели.")
                 return
 
-            # финальный текст (разбивка длинных ответов) + кнопка смены модели
-            quick = self.kb([[("🤖 Сменить модель", "qmodel")]])
-            if len(full) <= MAX_TG:
-                await self.edit(chat_id, msg_id, full, quick)
-            else:
-                chunks = []
-                rest = full
-                while rest:
-                    chunks.append(rest[:MAX_TG])
-                    rest = rest[MAX_TG:]
-                await self.edit(chat_id, msg_id, chunks[0], quick)
-                for c in chunks[1:]:
-                    await self.send(chat_id, c)
-
-            # сохраняем историю
+            # в историю — маркер вместо тяжёлых медиа
+            hist_user = marker or user_text
             history = history + [
-                {"role": "user", "content": user_text},
+                {"role": "user", "content": hist_user},
                 {"role": "assistant", "content": full},
             ]
             st["history"] = history[-max_hist * 2:]
             self.save_state()
+
+            await self.send_final(chat_id, msg_id, full)
         except ProviderError as e:
             err = f"⚠️ Ошибка провайдера ({provider['name']}):\n{e}"
+            if images and any(w in str(e).lower() for w in ("image", "vision", "медиа", "мультимод", "input type")):
+                err += "\n\n💡 Похоже, эта модель не принимает изображения — выберите другую: /model"
             try:
                 await self.edit(chat_id, msg_id, err[:MAX_TG])
             except TgError:
@@ -1068,6 +1594,7 @@ class App:
             except TgError:
                 await self.send(chat_id, err[:MAX_TG])
         finally:
+            await timer.stop()
             stop.set()
             typing_task.cancel()
             try:
@@ -1080,7 +1607,8 @@ class App:
     async def on_message(self, msg: Dict[str, Any]) -> None:
         chat_id = msg["chat"]["id"]
         uid = (msg.get("from") or {}).get("id", 0)
-        text = msg.get("text", "").strip()
+        text = (msg.get("text") or msg.get("caption") or "").strip()
+        has_media = bool(msg.get("photo") or msg.get("document"))
 
         # первый пользователь в личке становится владельцем
         if not self.cfg.get("admins") and msg["chat"]["type"] == "private" and uid:
@@ -1093,8 +1621,27 @@ class App:
             )
             return
 
-        if not text:
-            await self.send(chat_id, "Пока я понимаю только текстовые сообщения 🙏")
+        if not text and not has_media:
+            await self.send(chat_id, "Пока я понимаю текст, фото и файлы 🙏")
+            return
+
+        # фото и файлы → сразу в генерацию
+        if has_media:
+            if self.dialogs.get(chat_id):
+                await self.send(chat_id, "Сначала завершите мастер или отмените его (/cancel), потом пришлите файл.")
+                return
+            if not self.can_chat(uid):
+                await self.send(chat_id, "⛔ Общение с ботом ограничено администраторами.")
+                return
+            images, files_text, notes = await self.extract_media(msg)
+            if notes:
+                await self.send(chat_id, "⚠️ " + "\n⚠️ ".join(notes))
+            if not images and not files_text and not text:
+                return
+            if not text:
+                text = "Опиши подробно, что на изображении." if images else "Проанализируй содержимое файла."
+            marker = text if (msg.get("text") or msg.get("caption")) else ("[Фото]" if images else "[Файл]")
+            await self.generate_and_send(msg, text, images=images, files_text=files_text, marker=marker)
             return
 
         # мастер добавления провайдера перехватывает текст
@@ -1172,6 +1719,41 @@ class App:
             st["history"] = []
             self.save_state()
             await self.send(chat_id, "🧹 История диалога очищена.")
+            return True
+
+        if cmd == "web":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            on = not self.cfg.get("web_tools", True)
+            self.cfg["web_tools"] = on
+            self.save_config()
+            if on:
+                await self.send(chat_id,
+                                "🌐 Веб-инструменты ВКЛЮЧЕНЫ: модель может искать в интернете "
+                                "(web_search) и открывать страницы (read_url). "
+                                "Провайдеры без поддержки tools отключаются для них автоматически.")
+            else:
+                await self.send(chat_id, "🌐 Веб-инструменты ВЫКЛЮЧЕНЫ — модель отвечает только из своих знаний.")
+            return True
+
+        if cmd == "font":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            order = ["rich", "mono", "plain"]
+            titles = {"rich": "форматированный — жирный, курсив, код (markdown → HTML)",
+                      "mono": "моноширинный, как в терминале (как в референсе)",
+                      "plain": "простой текст без форматирования"}
+            a = args.strip().lower()
+            if a in titles:
+                cur = a
+            else:
+                cur = order[(order.index(self.cfg.get("font", "rich")) + 1) % 3]
+            self.cfg["font"] = cur
+            self.save_config()
+            await self.send(chat_id, f"🔤 Вид ответов: {titles[cur]}.\n"
+                                     "(/font переключает по кругу, или /font rich|mono|plain)")
             return True
 
         if cmd == "providers":
