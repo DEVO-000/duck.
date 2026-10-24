@@ -1,0 +1,19 @@
+# Render Blueprint — деплой бота одной кнопкой:
+#   Render → New + → Blueprint → выберите репозиторий с этими файлами.
+# Затем во время создания заполните BOT_TOKEN (и по желанию ADMIN_IDS).
+services:
+  - type: web
+    name: tg-ai-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false          # спросит при создании (токен от @BotFather)
+      - key: ADMIN_IDS
+        sync: false          # ваш Telegram ID (узнать: @userinfobot), можно оставить пустым
+      - key: SYSTEM_PROMPT
+        sync: false          # системный промпт, можно оставить пустым
+      - key: MAX_HISTORY
+        value: "24"
