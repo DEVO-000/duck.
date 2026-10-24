@@ -5,8 +5,11 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
 
 Умеет:
     • стриминг ответов с анимацией «⌛ Думаю · 7с» и живыми статусами
-      (Ищу в интернете / Читаю страницу), ответы оформляются markdown → HTML
-      (или моноширинным «терминалом» — /font);
+      (Ищу в интернете / Читаю страницу), ответы оформляются markdown → HTML;
+    • ВСЕ КОМАНДЫ — кнопками reply-клавиатуры под полем ввода,
+      разбитые по разделам (чат / провайдеры / настройки);
+    • ШРИФТ ОТВЕТОВ ИИ — переключается кнопкой 🔤 Шрифт или /font:
+      обычный (markdown), моноширинный, всё жирным, всё курсивом, простой;
     • ПРИНИМАЕТ ФОТО (vision) и файлы (код, txt, csv, json…) — модель видит их
       содержимое; история хранит маркеры вместо тяжёлых медиа;
     • веб-инструменты web_search (DuckDuckGo) и read_url с автоматическим
@@ -35,7 +38,8 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
     DEFAULT_PROVIDER     имя провайдера для дефолта (иначе первый PROVIDER_N)
     SYSTEM_PROMPT / MAX_HISTORY / ADMIN_ONLY — применяются при каждом старте
     WEB_TOOLS            0 = выключить веб-поиск по умолчанию (вкл: 1)
-    FONT                 вид ответов по умолчанию: rich | mono | plain
+    FONT                 шрифт ответов по умолчанию: rich | mono | bold | italic | plain
+                         (каждый чат может выбрать свой — кнопкой 🔤 Шрифт)
     Render сам задает PORT и RENDER_EXTERNAL_URL — бот поднимет HTTP-сервер
     (health-check на "/") и зарегистрирует webhook.
 
@@ -49,8 +53,9 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
                  под каждым ответом — можно менять модель каждый раз)
     /providers — список провайдеров
     /web       — веб-инструменты: поиск и чтение страниц
-    /font      — вид ответов: rich / mono / plain
-    /help      — все команды
+    /font      — меню шрифтов ИИ: обычный, моно, жирный, курсив, простой
+    /get_id    — custom_emoji_id стикеров набора (свои эмодзи-статусы)
+    /help      — все команды (продублированы кнопками под полем ввода)
 
 Провайдеры хранятся в config.json, история диалогов — в state.json
 (пути можно переопределить переменными CONFIG_PATH / STATE_PATH — например,
@@ -114,6 +119,50 @@ TG_FILE_BASE = "https://api.telegram.org/file/bot{token}/{path}"  # скачив
 UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
 TOOL_LABELS = {"web_search": "🌐 Ищу в интернете", "read_url": "📄 Читаю страницу"}
+
+# --- шрифты, которыми пишет ИИ (меню /font) ---
+FONTS = {
+    "rich": "🖋 Обычный (markdown)",
+    "mono": "💻 Моноширинный",
+    "bold": "🅱️ Всё жирным",
+    "italic": "✏️ Всё курсивом",
+    "plain": "📄 Простой текст",
+}
+FONT_ORDER = ["rich", "mono", "bold", "italic", "plain"]
+
+# --- reply-клавиатура: все команды кнопками, по разделам ---
+MENU_BTN = {
+    "🤖 Модель": "/model",
+    "📊 Статус": "/status",
+    "🔤 Шрифт": "/font",
+    "🌐 Поиск": "/web",
+    "➕ Провайдер": "/add",
+    "🧩 Провайдеры": "/providers",
+    "⭐ Дефолт": "/default",
+    "🗑 Удалить": "/del",
+    "💬 Промпт": "/sys",
+    "🔒 Только админы": "/lock",
+    "🧹 Очистить": "/clear",
+    "📋 Помощь": "/help",
+    "🆔 Мой ID": "/id",
+    "✖️ Отмена": "/cancel",
+}
+# Раздел «Чат и оформление» — видно всем:
+KB_USER_ROWS = [
+    ["🤖 Модель", "📊 Статус"],
+    ["🔤 Шрифт", "🧹 Очистить"],
+    ["📋 Помощь", "🆔 Мой ID"],
+]
+# Для админов добавляются разделы «Веб», «Провайдеры», «Настройки»:
+KB_ADMIN_ROWS = [
+    ["🤖 Модель", "📊 Статус"],
+    ["🔤 Шрифт", "🌐 Поиск"],
+    ["➕ Провайдер", "🧩 Провайдеры"],
+    ["⭐ Дефолт", "🗑 Удалить"],
+    ["💬 Промпт", "🔒 Только админы"],
+    ["🧹 Очистить", "📋 Помощь"],
+    ["🆔 Мой ID", "✖️ Отмена"],
+]
 
 TEXT_EXTS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".log", ".json", ".xml", ".yaml", ".yml",
@@ -288,24 +337,32 @@ HELP_TEXT = "\n".join([
     "💬 Просто напишите сообщение — отвечу через выбранную модель.",
     "📷 Можно присылать фото (модель их увидит) и файлы: код, txt, csv, json…",
     "🌐 Умею искать в интернете и открывать ссылки, если нужны свежие данные.",
+    "⌨️ Все команды продублированы кнопками под полем ввода, по разделам.",
     "",
-    "Команды:",
+    "— Чат и модель —",
     "/model — выбрать модель для этого чата",
     "/status — какая модель используется",
     "/clear — очистить историю диалога",
-    "/providers — список подключённых провайдеров",
+    "/id — показать ID (чата и ваш)",
     "",
-    "Для администраторов:",
+    "— Оформление —",
+    "/font — шрифт ответов ИИ: 🖋 обычный / 💻 моно / 🅱 жирный / ✏️ курсив / 📄 простой",
+    "",
+    "— Провайдеры (админ) —",
+    "/providers — список подключённых провайдеров",
     "/add — подключить провайдера: своя ссылка (авто) или пресет",
     "/del — удалить провайдера",
     "/default — модель по умолчанию для новых чатов",
     "/key <id> <ключ> — сменить API-ключ провайдера",
     "/url <id> <url> — сменить baseURL провайдера",
     "/web — вкл/выкл веб-инструменты (поиск и чтение страниц)",
-    "/font — вид ответов: форматированный / моноширинный / простой",
+    "",
+    "— Настройки (админ) —",
     "/sys <текст> — системный промпт (/sys off — выключить)",
     "/lock — переключить режим «только администраторы»",
-    "/id — показать ID (чата и ваш)",
+    "",
+    "— Прочее —",
+    "/get_id <набор> — custom_emoji_id стикеров набора",
     "/cancel — отменить текущий мастер",
 ])
 
@@ -414,7 +471,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> None:
         cfg["web_tools"] = False
         applied.append("WEB_TOOLS=0")
     ft = os.environ.get("FONT", "").strip().lower()
-    if ft in ("rich", "mono", "plain"):
+    if ft in FONTS:
         cfg["font"] = ft
         applied.append(f"FONT={ft}")
     if applied:
@@ -1132,6 +1189,8 @@ class App:
         self.models_cache: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
         # провайдеры, у которых веб-инструменты выключены (не поддерживают tools)
         self._no_tools: set = set()
+        # чаты, которым уже отправлена reply-клавиатура (не спамим повторами)
+        self._kb_chats: set = set()
         self._save_lock = asyncio.Lock()
 
     # ---------- persistence ----------
@@ -1182,7 +1241,9 @@ class App:
         raise err  # type: ignore[misc]
 
     async def send(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None,
-                   parse_mode: Optional[str] = None) -> Dict[str, Any]:
+                   parse_mode: Optional[str] = None, attach_kb: bool = False) -> Dict[str, Any]:
+        """sendMessage. attach_kb=True — приложить reply-клавиатуру-меню
+        (один раз на чат; в группах не прикладываем, там chat_id < 0)."""
         kwargs: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text[:MAX_TG],
@@ -1190,6 +1251,9 @@ class App:
         }
         if reply_markup:
             kwargs["reply_markup"] = reply_markup
+        elif attach_kb and chat_id > 0 and chat_id not in self._kb_chats:
+            self._kb_chats.add(chat_id)
+            kwargs["reply_markup"] = self.reply_kb(chat_id)  # в личке chat_id == uid
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
         return await self.api("sendMessage", **kwargs)
@@ -1368,6 +1432,28 @@ class App:
             ]
         }
 
+    def reply_kb(self, uid: int) -> Dict[str, Any]:
+        """Постоянная reply-клавиатура: все команды кнопками, по разделам.
+        Не-админы видят только общие разделы (чат / оформление)."""
+        rows = KB_ADMIN_ROWS if self.is_admin(uid) else KB_USER_ROWS
+        return {
+            "keyboard": [[{"text": t} for t in row] for row in rows],
+            "resize_keyboard": True,
+            "is_persistent": True,
+            "input_field_placeholder": "Сообщение, фото или файл для ИИ…",
+        }
+
+    def kb_font(self, cur: str) -> Dict[str, Any]:
+        """Меню выбора шрифта, которым пишет ИИ (✅ — текущий)."""
+        rows: List[List[Tuple[str, str]]] = []
+        for i in range(0, len(FONT_ORDER), 2):
+            row: List[Tuple[str, str]] = []
+            for f in FONT_ORDER[i:i + 2]:
+                title = ("✅ " + FONTS[f]) if f == cur else FONTS[f]
+                row.append((title, f"font:{f}"))
+            rows.append(row)
+        return self.kb(rows)
+
     def kb_providers(self, pick_prefix: str, back_data: Optional[str] = None) -> Dict[str, Any]:
         rows: List[List[Tuple[str, str]]] = []
         for pid, p in self.cfg["providers"].items():
@@ -1434,13 +1520,18 @@ class App:
                 pass
 
     async def send_final(self, chat_id: int, msg_id: int, text: str) -> None:
-        """Финальный ответ: оформление по /font + кнопка смены модели.
+        """Финальный ответ: оформление по шрифту чата (+ кнопка смены модели).
         Длинные ответы разбиваются (без форматирования)."""
         quick = self.kb([[("🤖 Сменить модель", "qmodel")]])
-        font = self.cfg.get("font", "rich")
+        st = self.chat_state(chat_id)
+        font = st.get("font") or self.cfg.get("font", "rich")
         html_text: Optional[str] = None
         if font == "mono":
             html_text = fmt_strict(text)
+        elif font == "bold":
+            html_text = "<b>" + md_to_html(text) + "</b>"
+        elif font == "italic":
+            html_text = "<i>" + md_to_html(text) + "</i>"
         elif font == "rich":
             html_text = md_to_html(text)
         if html_text is not None and len(html_text) <= MAX_TG:
@@ -1471,6 +1562,7 @@ class App:
                 chat_id,
                 "⚠️ Модель не выбрана.\n\nИспользуйте /model — выбрать модель\n"
                 "Или /add (если вы админ) — подключить провайдера",
+                attach_kb=True,
             )
             return
         pid, provider, model_id = resolved
@@ -1608,6 +1700,9 @@ class App:
         chat_id = msg["chat"]["id"]
         uid = (msg.get("from") or {}).get("id", 0)
         text = (msg.get("text") or msg.get("caption") or "").strip()
+        # кнопки reply-клавиатуры присылают свой текст — превращаем в команду
+        if text in MENU_BTN:
+            text = MENU_BTN[text]
         has_media = bool(msg.get("photo") or msg.get("document"))
 
         # первый пользователь в личке становится владельцем
@@ -1618,11 +1713,12 @@ class App:
                 chat_id,
                 "✅ Вы назначены администратором бота.\n\nНачните с /add — подключите провайдера, "
                 "затем /model — выберите модель.\n\n" + HELP_TEXT,
+                attach_kb=True,
             )
             return
 
         if not text and not has_media:
-            await self.send(chat_id, "Пока я понимаю текст, фото и файлы 🙏")
+            await self.send(chat_id, "Пока я понимаю текст, фото и файлы 🙏", attach_kb=True)
             return
 
         # фото и файлы → сразу в генерацию
@@ -1662,7 +1758,7 @@ class App:
             handled = await self.dispatch_command(msg, cmd, args)
             if handled:
                 return
-            await self.send(chat_id, f"Неизвестная команда /{cmd}. Смотрите /help")
+            await self.send(chat_id, f"Неизвестная команда /{cmd}. Смотрите /help", attach_kb=True)
             return
 
         if not self.can_chat(uid):
@@ -1675,18 +1771,18 @@ class App:
         uid = (msg.get("from") or {}).get("id", 0)
 
         if cmd in ("start", "help"):
-            await self.send(chat_id, HELP_TEXT)
+            await self.send(chat_id, HELP_TEXT, attach_kb=True)
             return True
 
         if cmd == "id":
-            await self.send(chat_id, f"Ваш ID: {uid}\nID чата: {chat_id}")
+            await self.send(chat_id, f"Ваш ID: {uid}\nID чата: {chat_id}", attach_kb=True)
             return True
 
         if cmd == "cancel":
             if self.dialogs.pop(chat_id, None):
-                await self.send(chat_id, "Мастер отменён.")
+                await self.send(chat_id, "Мастер отменён.", attach_kb=True)
             else:
-                await self.send(chat_id, "Нечего отменять.")
+                await self.send(chat_id, "Нечего отменять.", attach_kb=True)
             return True
 
         if cmd == "model":
@@ -1697,7 +1793,7 @@ class App:
             kb = self.kb_providers("pv")
             if extra:
                 kb["inline_keyboard"] = [extra] + kb["inline_keyboard"]
-            await self.send(chat_id, "🧩 Выберите провайдера:", kb)
+            await self.send(chat_id, "🧩 Выберите провайдера:", kb, attach_kb=True)
             return True
 
         if cmd == "status":
@@ -1709,16 +1805,17 @@ class App:
                 await self.send(
                     chat_id,
                     f"📌 Модель {src}:\n{provider['name']} → {self.model_display(pid, mid)}",
+                    attach_kb=True,
                 )
             else:
-                await self.send(chat_id, "⚠️ Модель не выбрана. Используйте /model")
+                await self.send(chat_id, "⚠️ Модель не выбрана. Используйте /model", attach_kb=True)
             return True
 
         if cmd == "clear":
             st = self.chat_state(chat_id)
             st["history"] = []
             self.save_state()
-            await self.send(chat_id, "🧹 История диалога очищена.")
+            await self.send(chat_id, "🧹 История диалога очищена.", attach_kb=True)
             return True
 
         if cmd == "web":
@@ -1732,28 +1829,45 @@ class App:
                 await self.send(chat_id,
                                 "🌐 Веб-инструменты ВКЛЮЧЕНЫ: модель может искать в интернете "
                                 "(web_search) и открывать страницы (read_url). "
-                                "Провайдеры без поддержки tools отключаются для них автоматически.")
+                                "Провайдеры без поддержки tools отключаются для них автоматически.",
+                                attach_kb=True)
             else:
-                await self.send(chat_id, "🌐 Веб-инструменты ВЫКЛЮЧЕНЫ — модель отвечает только из своих знаний.")
+                await self.send(chat_id,
+                                "🌐 Веб-инструменты ВЫКЛЮЧЕНЫ — модель отвечает только из своих знаний.",
+                                attach_kb=True)
             return True
 
         if cmd == "font":
-            if not self.is_admin(uid):
-                await self.send(chat_id, "⛔ Команда только для администраторов.")
-                return True
-            order = ["rich", "mono", "plain"]
-            titles = {"rich": "форматированный — жирный, курсив, код (markdown → HTML)",
-                      "mono": "моноширинный, как в терминале (как в референсе)",
-                      "plain": "простой текст без форматирования"}
+            st = self.chat_state(chat_id)
+            cur = st.get("font") or self.cfg.get("font", "rich")
             a = args.strip().lower()
-            if a in titles:
+            if a in FONTS:
+                st["font"] = a
+                self.save_state()
                 cur = a
-            else:
-                cur = order[(order.index(self.cfg.get("font", "rich")) + 1) % 3]
-            self.cfg["font"] = cur
-            self.save_config()
-            await self.send(chat_id, f"🔤 Вид ответов: {titles[cur]}.\n"
-                                     "(/font переключает по кругу, или /font rich|mono|plain)")
+            await self.send(
+                chat_id,
+                f"🔤 Шрифт, которым пишет ИИ (сейчас: {FONTS[cur]}).\n"
+                "Выберите из меню — настройка действует для этого чата.\n"
+                "Глобальный вид по умолчанию — переменная FONT в окружении.",
+                self.kb_font(cur),
+                attach_kb=True,
+            )
+            return True
+
+        if cmd == "get_id":
+            if not args:
+                await self.send(chat_id, "Использование: /get_id <имя_набора_стикеров>", attach_kb=True)
+                return True
+            try:
+                ss = await self.api("getStickerSet", http_timeout=20, name=args.strip())
+            except TgError as e:
+                await self.send(chat_id, f"Ошибка: {e}", attach_kb=True)
+                return True
+            lines = [f"{s.get('emoji', '')} — {s['custom_emoji_id']}"
+                     for s in ss.get("stickers", []) if s.get("custom_emoji_id")]
+            await self.send(chat_id, "\n".join(lines) or "В наборе нет стикеров с custom_emoji_id.",
+                            attach_kb=True)
             return True
 
         if cmd == "providers":
@@ -1768,7 +1882,7 @@ class App:
                     f"• {pid} — {p['name']} [{PROTOCOL_TITLES.get(p['protocol'], p['protocol'])}]{flag}\n"
                     f"  {p['base_url']} · ключ: {self.mask_key(p.get('api_key', ''))} · {n}"
                 )
-            await self.send(chat_id, "\n".join(lines))
+            await self.send(chat_id, "\n".join(lines), attach_kb=True)
             return True
 
         # ----- дальше только для админов -----
@@ -1787,14 +1901,15 @@ class App:
                 [(f"{p['name']} ({pid})", f"del:{pid}")]
                 for pid, p in self.cfg["providers"].items()
             ] or [[("нет провайдеров", "noop")]]
-            await self.send(chat_id, "🗑 Какого провайдера удалить?", self.kb(rows))
+            await self.send(chat_id, "🗑 Какого провайдера удалить?", self.kb(rows), attach_kb=True)
             return True
 
         if cmd == "default":
             if not self.is_admin(uid):
                 await self.send(chat_id, "⛔ Команда только для администраторов.")
                 return True
-            await self.send(chat_id, "⭐ Провайдер по умолчанию:", self.kb_providers("defpv", "noop"))
+            await self.send(chat_id, "⭐ Провайдер по умолчанию:", self.kb_providers("defpv", "noop"),
+                            attach_kb=True)
             return True
 
         if cmd == "key":
@@ -1803,12 +1918,13 @@ class App:
                 return True
             parts = args.split(maxsplit=1)
             if len(parts) < 2 or parts[0] not in self.cfg["providers"]:
-                await self.send(chat_id, "Формат: /key <id> <новый ключ>\nID смотрите в /providers")
+                await self.send(chat_id, "Формат: /key <id> <новый ключ>\nID смотрите в /providers",
+                                attach_kb=True)
                 return True
             self.cfg["providers"][parts[0]]["api_key"] = parts[1].strip()
             self.models_cache.pop(parts[0], None)
             self.save_config()
-            await self.send(chat_id, f"✅ Ключ {parts[0]} обновлён. Проверить: /model")
+            await self.send(chat_id, f"✅ Ключ {parts[0]} обновлён. Проверить: /model", attach_kb=True)
             return True
 
         if cmd == "url":
@@ -1817,16 +1933,18 @@ class App:
                 return True
             parts = args.split(maxsplit=1)
             if len(parts) < 2 or parts[0] not in self.cfg["providers"]:
-                await self.send(chat_id, "Формат: /url <id> <baseURL>\nНапример: /url p1 https://openrouter.ai/api/v1")
+                await self.send(chat_id,
+                                "Формат: /url <id> <baseURL>\nНапример: /url p1 https://openrouter.ai/api/v1",
+                                attach_kb=True)
                 return True
             url = parts[1].strip().rstrip("/")
             if not url.startswith(("http://", "https://")):
-                await self.send(chat_id, "URL должен начинаться с http:// или https://")
+                await self.send(chat_id, "URL должен начинаться с http:// или https://", attach_kb=True)
                 return True
             self.cfg["providers"][parts[0]]["base_url"] = url
             self.models_cache.pop(parts[0], None)
             self.save_config()
-            await self.send(chat_id, f"✅ baseURL {parts[0]} → {url}")
+            await self.send(chat_id, f"✅ baseURL {parts[0]} → {url}", attach_kb=True)
             return True
 
         if cmd == "sys":
@@ -1836,11 +1954,11 @@ class App:
             if not args or args.lower() in ("off", "выкл"):
                 self.cfg["system_prompt"] = ""
                 self.save_config()
-                await self.send(chat_id, "Системный промпт выключен.")
+                await self.send(chat_id, "Системный промпт выключен.", attach_kb=True)
             else:
                 self.cfg["system_prompt"] = args
                 self.save_config()
-                await self.send(chat_id, f"✅ Системный промпт сохранён:\n{args[:500]}")
+                await self.send(chat_id, f"✅ Системный промпт сохранён:\n{args[:500]}", attach_kb=True)
             return True
 
         if cmd == "lock":
@@ -1850,7 +1968,7 @@ class App:
             self.cfg["admins_only"] = not self.cfg.get("admins_only", False)
             self.save_config()
             state = "включён — писать могут только администраторы" if self.cfg["admins_only"] else "выключен — писать могут все"
-            await self.send(chat_id, f"🔒 Режим «только администраторы» {state}.")
+            await self.send(chat_id, f"🔒 Режим «только администраторы» {state}.", attach_kb=True)
             return True
 
         return False
@@ -2067,6 +2185,21 @@ class App:
             if st.get("provider") and st.get("model"):
                 kb["inline_keyboard"] = [[("⟲ Сбросить на модель по умолчанию", "seldef")]] + kb["inline_keyboard"]
             await self.edit(chat_id, msg.get("message_id", 0), "🧩 Выберите провайдера:", kb)
+            return
+
+        # --- выбор шрифта, которым пишет ИИ (меню /font) ---
+        if data.startswith("font:"):
+            f = data[5:]
+            if f in FONTS:
+                st = self.chat_state(chat_id)
+                st["font"] = f
+                self.save_state()
+                await self.edit(
+                    chat_id,
+                    msg.get("message_id", 0),
+                    f"🔤 Шрифт ответов ИИ: {FONTS[f]}\nСледующий ответ придёт в этом стиле.",
+                    self.kb_font(f),
+                )
             return
 
         # --- обновление списка моделей с сервера (🔄) ---
