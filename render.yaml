@@ -18,14 +18,16 @@ services:
       # Провайдеры из env, примеры:
       #   PROVIDER_1=openrouter:sk-or-v1-...
       #   PROVIDER_2=deepseek:sk-...
-      #   PROVIDER_3=Мой прокси|openai|https://api.example.com/v1|key123
+      #   PROVIDER_3=Мой прокси|auto|https://api.example.com/v1|key123  (протокол определится по URL)
+      #   PROVIDER_4=Ollama|openai|http://мой-хост:11434|               (без ключа)
       - key: PROVIDER_1
         sync: false
       - key: PROVIDER_2
         sync: false
-      # Свой провайдер с произвольным URL (без пресетов):
+      # Свой провайдер с произвольным URL (без пресетов, ни от кого не зависит):
       #   CUSTOM_URL=https://api.мой-сервер.com/v1
-      #   CUSTOM_PROTOCOL=openai|anthropic|gemini (по умолчанию openai)
+      #   CUSTOM_KEY=sk-...        (пустой = сервер без ключа, напр. Ollama/LM Studio)
+      #   CUSTOM_PROTOCOL=openai|anthropic|gemini|auto (auto — определить по URL)
       #   CUSTOM_NAME / CUSTOM_MODEL — имя в меню и модель по умолчанию
       - key: CUSTOM_URL
         sync: false

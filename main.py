@@ -13,11 +13,14 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
     PROVIDER_1..N        провайдеры, применяются при каждом старте:
                            PROVIDER_1=openrouter:sk-or-v1-…        (пресет:ключ)
                            PROVIDER_2=DeepSeek|openai|https://api.deepseek.com/v1|sk-…
+                           PROVIDER_3=My|auto|https://api.example.com/v1|sk-…  (тип API определится сам)
                            (пресеты: openrouter openai anthropic google gemini zai
                             groq deepseek mistral xai moonshot together fireworks cerebras)
     CUSTOM_URL / CUSTOM_KEY / CUSTOM_NAME / CUSTOM_PROTOCOL / CUSTOM_MODEL
                          свой провайдер с произвольным URL — без пресетов,
-                         ни от кого не зависит (id: ec)
+                         ни от кого не зависит (id: ec); CUSTOM_KEY пустой = сервер
+                         без ключа (Ollama/LM Studio/vLLM); CUSTOM_PROTOCOL=auto —
+                         определить по URL
     DEFAULT_MODEL        модель по умолчанию, напр. deepseek-chat или openai/gpt-4o-mini
     DEFAULT_PROVIDER     имя провайдера для дефолта (иначе первый PROVIDER_N)
     SYSTEM_PROMPT / MAX_HISTORY / ADMIN_ONLY — применяются при каждом старте
@@ -25,8 +28,13 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
     (health-check на "/") и зарегистрирует webhook.
 
 Дальше всё настраивается и прямо в Telegram:
-    /add       — добавить провайдера (пресеты OpenRouter/OpenAI/Anthropic/...)
-    /model     — выбрать модель для чата
+    /add       — добавить провайдера: «🔗 Своя ссылка (авто)» — просто URL,
+                 бот сам определит тип API и сам загрузит список доступных
+                 моделей по вашему ключу (ключ можно пропустить — для
+                 Ollama/LM Studio/vLLM); либо пресеты OpenRouter/OpenAI/…
+    /model     — выбрать модель для чата (кнопка 🔄 перезагружает список
+                 моделей с сервера; кнопка «🤖 Сменить модель» появляется
+                 под каждым ответом — можно менять модель каждый раз)
     /providers — список провайдеров
     /help      — все команды
 
@@ -88,6 +96,13 @@ PROTOCOL_TITLES = {
 }
 
 PRESETS: Dict[str, Dict[str, str]] = {
+    "custom-auto": {
+        "name": "🔗 Своя ссылка (авто)",
+        "protocol": "",  # определится автоматически по URL
+        "base_url": "",
+        "docs": "",
+        "hint": "Просто URL — бот сам определит тип API",
+    },
     "custom-openai": {
         "name": "Свой сервер (OpenAI-compatible)",
         "protocol": "openai",
@@ -214,7 +229,7 @@ HELP_TEXT = "\n".join([
     "/providers — список подключённых провайдеров",
     "",
     "Для администраторов:",
-    "/add — подключить провайдера (мастер с пресетами)",
+    "/add — подключить провайдера: своя ссылка (авто) или пресет",
     "/del — удалить провайдера",
     "/default — модель по умолчанию для новых чатов",
     "/key <id> <ключ> — сменить API-ключ провайдера",
@@ -228,6 +243,19 @@ HELP_TEXT = "\n".join([
 
 class ProviderError(RuntimeError):
     """Ошибка на стороне провайдера (показываем пользователю как есть)."""
+
+
+def detect_protocol(url: str) -> str:
+    """Определить протокол API по ссылке — как в opencode, где обычно
+    достаточно одного URL. Anthropic и Google узнаются по домену,
+    всё остальное (OpenAI, OpenRouter, vLLM, Ollama, прокси) —
+    OpenAI-compatible, это де-факто стандарт."""
+    u = (url or "").lower()
+    if "anthropic" in u:
+        return "anthropic"
+    if "generativelanguage" in u or "gemini" in u or "aiplatform.googleapis" in u:
+        return "gemini"
+    return "openai"
 
 
 class TgError(RuntimeError):
@@ -335,13 +363,15 @@ def parse_provider_spec(raw: str) -> Optional[Dict[str, str]]:
                 "base_url": preset["base_url"],
                 "api_key": key.strip(),
             }
-    # форма 2: Имя|протокол|URL|ключ
+    # форма 2: Имя|протокол|URL|ключ (протокол "auto" — определить по URL)
     parts = raw.split("|")
     if len(parts) >= 3:
         name, proto, url = parts[0].strip(), parts[1].strip().lower(), parts[2].strip()
         key = parts[3].strip() if len(parts) > 3 else ""
         if proto == "google":
             proto = "gemini"
+        if proto == "auto":
+            proto = detect_protocol(url)
         if proto in PROTOCOLS and url.startswith(("http://", "https://")):
             return {"name": name, "protocol": proto, "base_url": url.rstrip("/"), "api_key": key}
     return None
@@ -408,6 +438,8 @@ def sync_env_providers(cfg: Dict[str, Any]) -> None:
             proto = clean_secret(os.environ.get("CUSTOM_PROTOCOL", "")).lower()
             if proto == "google":
                 proto = "gemini"
+            if proto == "auto":
+                proto = detect_protocol(c_url)
             if proto not in PROTOCOLS:
                 if proto:
                     print(f"⚠️ CUSTOM_PROTOCOL={proto}: знаю только openai/anthropic/gemini — беру openai")
@@ -569,7 +601,9 @@ async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any
         return out
 
     if proto == "anthropic":
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        headers = {"anthropic-version": "2023-06-01"}
+        if key:
+            headers["x-api-key"] = key
         async with session.get(f"{base}/v1/models?limit=1000", headers=headers) as r:
             data = await _json_or_error(r)
         out = []
@@ -579,10 +613,18 @@ async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any
                 out.append((mid, m.get("display_name") or m.get("name") or mid))
         return out
 
-    # openai-compatible
+    # openai-compatible; если пользователь дал ссылку без /v1 — пробуем и /v1/models
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    async with session.get(f"{base}/models", headers=headers) as r:
-        data = await _json_or_error(r)
+    candidates = [f"{base}/models"]
+    if not re.search(r"/v\d+$", base):
+        candidates.append(f"{base}/v1/models")
+    data: Dict[str, Any] = {}
+    for u in candidates:
+        async with session.get(u, headers=headers) as r:
+            if r.status == 404 and u != candidates[-1]:
+                continue
+            data = await _json_or_error(r)
+            break
     items = data.get("data") or data.get("models") or []
     out = []
     for m in items:
@@ -607,7 +649,10 @@ async def stream_chat(
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
 
     if proto == "openai":
-        url = f"{base}/chat/completions"
+        # без /v1 в конце — пробуем и /v1/chat/completions (кастомные ссылки)
+        urls = [f"{base}/chat/completions"]
+        if not re.search(r"/v\d+$", base):
+            urls.append(f"{base}/v1/chat/completions")
         headers = {"Content-Type": "application/json"}
         if key:
             headers["Authorization"] = f"Bearer {key}"
@@ -617,7 +662,9 @@ async def stream_chat(
         payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
     elif proto == "anthropic":
         url = f"{base}/v1/messages"
-        headers = {"Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"}
+        headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+        if key:
+            headers["x-api-key"] = key
         payload = {
             "model": model,
             "max_tokens": MAX_TOKENS_ANTHROPIC,
@@ -645,39 +692,55 @@ async def stream_chat(
     else:
         raise ProviderError(f"Неизвестный протокол: {proto}")
 
-    async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-        if resp.status >= 400:
-            text = (await resp.text())[:400].replace("\n", " ")
-            raise ProviderError(f"HTTP {resp.status}: {text}")
-
-        async for line in _sse_data_lines(resp):
-            if line == "[DONE]":
+    resp: Optional[aiohttp.ClientResponse] = None
+    try:
+        if proto == "openai":
+            for i, u in enumerate(urls):
+                r = await session.post(u, json=payload, headers=headers, timeout=timeout)
+                if r.status == 404 and i < len(urls) - 1:
+                    r.close()
+                    continue
+                resp = r
                 break
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
+        else:
+            resp = await session.post(url, json=payload, headers=headers, timeout=timeout)
 
-            if proto == "openai":
-                choices = obj.get("choices") or [{}]
-                delta = (choices[0].get("delta") or {}).get("content")
-                if delta:
-                    yield delta
-            elif proto == "anthropic":
-                t = obj.get("type")
-                if t == "content_block_delta":
-                    d = obj.get("delta") or {}
-                    piece = d.get("text") or d.get("partial_json")
-                    if piece:
-                        yield piece
-                elif t == "error":
-                    raise ProviderError(json.dumps(obj.get("error"), ensure_ascii=False)[:300])
-            else:  # gemini
-                for cand in obj.get("candidates") or []:
-                    for part in ((cand.get("content") or {}).get("parts") or []):
-                        piece = part.get("text")
+        async with resp:
+            if resp.status >= 400:
+                text = (await resp.text())[:400].replace("\n", " ")
+                raise ProviderError(f"HTTP {resp.status}: {text}")
+
+            async for line in _sse_data_lines(resp):
+                if line == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+
+                if proto == "openai":
+                    choices = obj.get("choices") or [{}]
+                    delta = (choices[0].get("delta") or {}).get("content")
+                    if delta:
+                        yield delta
+                elif proto == "anthropic":
+                    t = obj.get("type")
+                    if t == "content_block_delta":
+                        d = obj.get("delta") or {}
+                        piece = d.get("text") or d.get("partial_json")
                         if piece:
                             yield piece
+                    elif t == "error":
+                        raise ProviderError(json.dumps(obj.get("error"), ensure_ascii=False)[:300])
+                else:  # gemini
+                    for cand in obj.get("candidates") or []:
+                        for part in ((cand.get("content") or {}).get("parts") or []):
+                            piece = part.get("text")
+                            if piece:
+                                yield piece
+    finally:
+        if resp is not None and not resp.closed:
+            resp.close()
 
 
 # ----------------------------------------------------------------------------
@@ -890,6 +953,7 @@ class App:
         if page < pages - 1:
             nav.append(("➡️", f"{pick_prefix}pg:{pid}:{page + 1}"))
         rows.append(nav)
+        rows.append([("🔄 Обновить список моделей", f"rm:{pick_prefix}:{pid}")])
         rows.append([("⬅️ К провайдерам", back_data)])
         return self.kb(rows), None
 
@@ -968,16 +1032,17 @@ class App:
                 await self.edit(chat_id, msg_id, "⚠️ Пустой ответ от модели.")
                 return
 
-            # финальный текст (разбивка длинных ответов)
+            # финальный текст (разбивка длинных ответов) + кнопка смены модели
+            quick = self.kb([[("🤖 Сменить модель", "qmodel")]])
             if len(full) <= MAX_TG:
-                await self.edit(chat_id, msg_id, full)
+                await self.edit(chat_id, msg_id, full, quick)
             else:
                 chunks = []
                 rest = full
                 while rest:
                     chunks.append(rest[:MAX_TG])
                     rest = rest[MAX_TG:]
-                await self.edit(chat_id, msg_id, chunks[0])
+                await self.edit(chat_id, msg_id, chunks[0], quick)
                 for c in chunks[1:]:
                     await self.send(chat_id, c)
 
@@ -1222,7 +1287,9 @@ class App:
         await self.send(
             chat_id,
             "🧩 Подключение провайдера.\n"
-            "«Свой сервер» — любой ваш URL и ключ, ни от кого не зависит.\n"
+            "«🔗 Своя ссылка (авто)» — просто URL, бот сам определит тип API\n"
+            "и сам загрузит список моделей. Ключ не обязателен — подойдёт\n"
+            "самохостинг без ключа (Ollama / LM Studio / vLLM).\n"
             "Остальные — пресеты: выбрал → вставил только API-ключ:",
             self.kb(rows),
         )
@@ -1238,10 +1305,16 @@ class App:
                 await self.send(chat_id, "URL должен начинаться с http:// или https://. Попробуйте ещё раз (или /cancel):")
                 return
             data["base_url"] = url
+            note = ""
+            if data.get("auto"):
+                data["protocol"] = detect_protocol(url)
+                m = re.match(r"https?://([^/\s]+)", url)
+                data["name"] = m.group(1) if m else "Мой провайдер"
+                note = (f"🔌 Тип API определён: {PROTOCOL_TITLES.get(data['protocol'], data['protocol'])}\n")
             dlg["step"] = "key"
             await self.send(
                 chat_id,
-                "🔑 Теперь пришлите API-ключ (или /skip, если сервер без ключа):",
+                f"{note}🔑 Теперь пришлите API-ключ (или /skip, если сервер без ключа):",
             )
             return
 
@@ -1266,11 +1339,17 @@ class App:
             self.dialogs.pop(chat_id, None)
 
             status = f"✅ Провайдер «{name}» сохранён (id: {pid})."
-            await self.send(chat_id, f"{status}\nЗагружаю список моделей…")
+            await self.send(chat_id, f"{status}\n🔍 Проверяю ключ и загружаю список моделей…")
             try:
                 models = await self.get_models(pid, force=True)
                 if models:
-                    await self.send(chat_id, f"📦 Загружено моделей: {len(models)}\n\nТеперь: /model — выбрать модель, или /default — сделать её дефолтной.")
+                    await self.send(
+                        chat_id,
+                        f"📦 Доступно моделей: {len(models)} — ключ работает.\n\n"
+                        f"Теперь: /model — выбрать модель (кнопкой 🔄 список моделей\n"
+                        f"можно перезагрузить в любой момент) или /default — сделать модель\n"
+                        f"дефолтной для новых чатов.",
+                    )
                 else:
                     await self.send(chat_id, "⚠️ Список моделей пуст. Проверьте ключ (/key) и адрес (/url).")
             except ProviderError as e:
@@ -1319,6 +1398,7 @@ class App:
                 "protocol": preset["protocol"],
                 "base_url": preset["base_url"],
                 "preset_id": preset_id,
+                "auto": preset_id == "custom-auto",
             }
             if preset["base_url"]:
                 dlg["step"] = "key"
@@ -1330,10 +1410,18 @@ class App:
                 )
             else:
                 dlg["step"] = "url"
+                if preset_id == "custom-auto":
+                    txt = ("Пришлите просто ссылку на API (baseURL), например:\n"
+                           "https://api.example.com/v1\n\n"
+                           "Я сам определю тип API (OpenAI / Anthropic / Gemini),\n"
+                           "проверю ключ и загружу список доступных моделей.\n"
+                           "Ключ можно пропустить (/skip) — для Ollama, LM Studio и т.п.")
+                else:
+                    txt = "Пришлите baseURL, например:\nhttps://api.example.com/v1"
                 await self.edit(
                     chat_id,
                     msg.get("message_id", 0),
-                    f"✅ {preset['name']}\nПришлите baseURL, например:\nhttps://api.example.com/v1",
+                    f"✅ {preset['name']}\n{txt}",
                 )
             return
 
@@ -1388,6 +1476,44 @@ class App:
 
         if data == "bk":
             await self.edit(chat_id, msg.get("message_id", 0), "🧩 Выберите провайдера:", self.kb_providers("pv"))
+            return
+
+        # --- быстрая смена модели (кнопка под ответом бота) ---
+        if data == "qmodel":
+            st = self.chat_state(chat_id)
+            kb = self.kb_providers("pv")
+            if st.get("provider") and st.get("model"):
+                kb["inline_keyboard"] = [[("⟲ Сбросить на модель по умолчанию", "seldef")]] + kb["inline_keyboard"]
+            await self.edit(chat_id, msg.get("message_id", 0), "🧩 Выберите провайдера:", kb)
+            return
+
+        # --- обновление списка моделей с сервера (🔄) ---
+        m = re.match(r"^rm:(sel|defsel):([^:]+)$", data)
+        if m:
+            pick, pid = m.group(1), m.group(2)
+            back = "bk" if pick == "sel" else "defbk"
+            provider = self.cfg["providers"].get(pid)
+            if not provider:
+                await self.edit(chat_id, msg.get("message_id", 0), "⚠️ Провайдер удалён. Откройте /model заново.")
+                return
+            try:
+                await self.get_models(pid, force=True)
+            except ProviderError as e:
+                await self.edit(chat_id, msg.get("message_id", 0),
+                                f"⚠️ Не удалось обновить список моделей:\n{e}")
+                return
+            kb, err = await self.kb_models(pid, 0, pick, back)
+            if err:
+                await self.edit(chat_id, msg.get("message_id", 0), f"⚠️ {err}")
+                return
+            title = "🤖" if pick == "sel" else "⭐"
+            n = len(self.models_cache.get(pid, (0, []))[1])
+            await self.edit(
+                chat_id,
+                msg.get("message_id", 0),
+                f"{title} {provider['name']} — список моделей обновлён ({n} шт.):",
+                kb,
+            )
             return
 
         # --- /default ---
