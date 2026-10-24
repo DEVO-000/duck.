@@ -1,511 +1,1274 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Telegram-бот на DeepSeek: окно «Думаю Nс», доступ в интернет,
-история диалога, красивое HTML-форматирование.
+TG AI Bot — Telegram-бот с подключаемыми AI-провайдерами (как в opencode).
 
-Токены берутся ТОЛЬКО из переменных окружения:
-    TELEGRAM_TOKEN
-    DEEPSEEK_API_KEY
-
-Установка:
-    pip install -U aiogram openai aiohttp ddgs
-
-Запуск локально:
-    export TELEGRAM_TOKEN=...
-    export DEEPSEEK_API_KEY=...
+Быстрый старт:
+    pip install aiohttp
     python main.py
 
-На Render: добавить обе переменные в Environment → Save.
+При первом запуске скрипт спросит токен бота (получите у @BotFather) и создаст
+config.json рядом с собой. Дальше всё настраивается прямо в Telegram:
+    /add       — добавить провайдера (пресеты OpenRouter/OpenAI/Anthropic/...)
+    /model     — выбрать модель для чата
+    /providers — список провайдеров
+    /help      — все команды
+
+Провайдеры хранятся в config.json, история диалогов — в state.json.
+Зависимость одна: aiohttp. Python 3.9+.
 """
+
+from __future__ import annotations
+
 import asyncio
-import html
 import json
 import os
-import random
 import re
 import sys
 import time
-from datetime import datetime
-
-import aiohttp
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, MessageEntity
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from openai import AsyncOpenAI
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 try:
-    from ddgs import DDGS
-except ImportError:  # старое имя пакета
-    from duckduckgo_search import DDGS
-
-
-# ====================== ТОКЕНЫ (только из окружения) ======================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-
-if not TELEGRAM_TOKEN or ":" not in TELEGRAM_TOKEN:
-    print("❌ TELEGRAM_TOKEN не задан или имеет неверный формат.", file=sys.stderr)
-    print("   Укажите переменную окружения TELEGRAM_TOKEN (токен от @BotFather).", file=sys.stderr)
+    import aiohttp
+except ImportError:
+    print("Не хватает зависимости. Установите её командой:\n    pip install aiohttp")
     sys.exit(1)
 
-if not DEEPSEEK_API_KEY:
-    print("❌ DEEPSEEK_API_KEY не задан.", file=sys.stderr)
-    print("   Укажите переменную окружения DEEPSEEK_API_KEY.", file=sys.stderr)
-    sys.exit(1)
+# ----------------------------------------------------------------------------
+# Константы
+# ----------------------------------------------------------------------------
 
-deepseek = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com", timeout=180.0)
-bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+STATE_PATH = os.path.join(BASE_DIR, "state.json")
 
-# ====================== НАСТРОЙКИ ======================
-SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-STATUS_LINES = 5
-STATUS_WIDTH = 38
-STATUS_INTERVAL = 0.45
-ANSWER_INTERVAL = 0.35
-HISTORY_LIMIT = 12
-MAX_SEARCH_ROUNDS = 3
+TG_API = "https://api.telegram.org/bot{token}/{method}"
 
-REASONING: dict[int, bool] = {}
-SEARCH: dict[int, bool] = {}
-HISTORY: dict[int, list[dict]] = {}
-LOCKS: dict[int, asyncio.Lock] = {}
+PAGE_SIZE = 12          # моделей на страницу в клавиатуре
+MODELS_TTL = 300        # секунд кэша списка моделей
+EDIT_EVERY = 1.6        # интервал редактирования сообщения при стриминге
+MAX_TG = 4000           # безопасный лимит длины сообщения Telegram
+MAX_TOKENS_ANTHROPIC = 8192
 
+PROTOCOLS = ("openai", "anthropic", "gemini")
+PROTOCOL_TITLES = {
+    "openai": "OpenAI-compatible",
+    "anthropic": "Anthropic-compatible",
+    "gemini": "Google Gemini",
+}
 
-# ====================== УТИЛИТЫ ======================
-def utf16_len(s: str) -> int:
-    return len(s.encode("utf-16-le")) // 2
-
-
-def wrap(text: str, width: int) -> list[str]:
-    words, lines, cur = text.split(" "), [], ""
-    for w in words:
-        while len(w) > width:
-            if cur:
-                lines.append(cur)
-                cur = ""
-            lines.append(w[:width])
-            w = w[width:]
-        if len(cur) + len(w) + (1 if cur else 0) <= width:
-            cur = f"{cur} {w}".strip()
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-# ====================== ОКНО «ДУМАЮ» ======================
-def render_status(title: str, secs: int, frame: int, text: str) -> tuple[str, list[MessageEntity]]:
-    header = f"{SPINNER[frame % len(SPINNER)]} {title} {secs}с"
-    lines: list[str] = []
-    for ln in text.splitlines():
-        if ln.strip():
-            lines.extend(wrap(ln.strip(), STATUS_WIDTH))
-    shown = lines[-STATUS_LINES:]
-    shown += ["\u00A0"] * (STATUS_LINES - len(shown))
-    body = "\n".join(shown)
-    full = f"{header}\n{body}"
-    entities = [
-        MessageEntity(type="bold", offset=0, length=utf16_len(header)),
-        MessageEntity(type="blockquote", offset=utf16_len(header) + 1, length=utf16_len(body)),
-    ]
-    return full, entities
-
-
-# ====================== ИНТЕРНЕТ ======================
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Поиск в интернете. Используй для новостей, курсов, погоды, фактов после 2024 года, "
-                           "цен, версий ПО и всего, что могло измениться.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string", "description": "Короткий поисковый запрос"}},
-                "required": ["query"],
-            },
-        },
+PRESETS: Dict[str, Dict[str, str]] = {
+    "openrouter": {
+        "name": "OpenRouter",
+        "protocol": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+        "docs": "https://openrouter.ai/keys",
+        "hint": "Сотни моделей одним ключом",
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_url",
-            "description": "Открыть страницу по ссылке и получить её текст (для деталей из результатов поиска).",
-            "parameters": {
-                "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
-            },
-        },
+    "openai": {
+        "name": "OpenAI",
+        "protocol": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "docs": "https://platform.openai.com/api-keys",
+        "hint": "GPT-4o, GPT-4.1, o3",
     },
-]
+    "anthropic": {
+        "name": "Anthropic",
+        "protocol": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "docs": "https://console.anthropic.com/settings/keys",
+        "hint": "Claude Opus / Sonnet / Haiku",
+    },
+    "google": {
+        "name": "Google Gemini",
+        "protocol": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "docs": "https://aistudio.google.com/apikey",
+        "hint": "Gemini 2.5 Pro / Flash",
+    },
+    "zai": {
+        "name": "Z.AI (Zhipu)",
+        "protocol": "openai",
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "docs": "https://z.ai/manage-apikey/apikey-list",
+        "hint": "GLM-4.6, GLM-4.5",
+    },
+    "groq": {
+        "name": "Groq",
+        "protocol": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+        "docs": "https://console.groq.com/keys",
+        "hint": "Llama, Qwen — быстрый инференс",
+    },
+    "deepseek": {
+        "name": "DeepSeek",
+        "protocol": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "docs": "https://platform.deepseek.com/api_keys",
+        "hint": "DeepSeek-V3, R1",
+    },
+    "mistral": {
+        "name": "Mistral AI",
+        "protocol": "openai",
+        "base_url": "https://api.mistral.ai/v1",
+        "docs": "https://console.mistral.ai/api-keys",
+        "hint": "Mistral Large / Medium",
+    },
+    "xai": {
+        "name": "xAI (Grok)",
+        "protocol": "openai",
+        "base_url": "https://api.x.ai/v1",
+        "docs": "https://console.x.ai",
+        "hint": "Grok-4, Grok-3",
+    },
+    "moonshot": {
+        "name": "Moonshot (Kimi)",
+        "protocol": "openai",
+        "base_url": "https://api.moonshot.ai/v1",
+        "docs": "https://platform.moonshot.ai/console/api-keys",
+        "hint": "Kimi K2",
+    },
+    "together": {
+        "name": "Together AI",
+        "protocol": "openai",
+        "base_url": "https://api.together.xyz/v1",
+        "docs": "https://api.together.ai/settings/api-keys",
+        "hint": "Open-source модели",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "protocol": "openai",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "docs": "https://fireworks.ai/account/api-keys",
+        "hint": "Хостинг open-source",
+    },
+    "cerebras": {
+        "name": "Cerebras",
+        "protocol": "openai",
+        "base_url": "https://api.cerebras.ai/v1",
+        "docs": "https://cloud.cerebras.ai",
+        "hint": "Сверхбыстрый инференс",
+    },
+    "custom-openai": {
+        "name": "Свой OpenAI-compatible",
+        "protocol": "openai",
+        "base_url": "",
+        "docs": "",
+        "hint": "vLLM, LM Studio, прокси…",
+    },
+    "custom-anthropic": {
+        "name": "Свой Anthropic-compatible",
+        "protocol": "anthropic",
+        "base_url": "",
+        "docs": "",
+        "hint": "Клоны Claude API",
+    },
+    "custom-gemini": {
+        "name": "Свой Gemini-compatible",
+        "protocol": "gemini",
+        "base_url": "",
+        "docs": "",
+        "hint": "Прокси Gemini API",
+    },
+}
+
+HELP_TEXT = "\n".join([
+    "👋 Я AI-бот с подключаемыми провайдерами (как в opencode).",
+    "",
+    "💬 Просто напишите сообщение — я отвечу через выбранную модель.",
+    "",
+    "Команды:",
+    "/model — выбрать модель для этого чата",
+    "/status — какая модель используется",
+    "/clear — очистить историю диалога",
+    "/providers — список подключённых провайдеров",
+    "",
+    "Для администраторов:",
+    "/add — подключить провайдера (мастер с пресетами)",
+    "/del — удалить провайдера",
+    "/default — модель по умолчанию для новых чатов",
+    "/key <id> <ключ> — сменить API-ключ провайдера",
+    "/url <id> <url> — сменить baseURL провайдера",
+    "/sys <текст> — системный промпт (/sys off — выключить)",
+    "/lock — переключить режим «только администраторы»",
+    "/id — показать ID (чата и ваш)",
+    "/cancel — отменить текущий мастер",
+])
 
 
-def _ddgs_search(query: str, n: int = 6) -> list[dict]:
-    with DDGS() as d:
-        return list(d.text(query, region="ru-ru", max_results=n))
+class ProviderError(RuntimeError):
+    """Ошибка на стороне провайдера (показываем пользователю как есть)."""
 
 
-async def web_search(query: str) -> list[dict]:
+class TgError(RuntimeError):
+    """Ошибка Telegram Bot API."""
+
+
+# ----------------------------------------------------------------------------
+# Работа с файлами (config.json / state.json)
+# ----------------------------------------------------------------------------
+
+def default_config() -> Dict[str, Any]:
+    return {
+        "bot_token": "",
+        "admins": [],            # Telegram user id; пусто = первый /start станет владельцем
+        "admins_only": False,    # True = общаться могут только администраторы
+        "system_prompt": "",
+        "max_history": 24,       # сообщений (пар) в истории на чат
+        "default": {"provider": "", "model": ""},
+        "providers": {},         # pid -> {name, protocol, base_url, api_key, enabled}
+    }
+
+
+def _atomic_write(path: str, data: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_json(path: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        raw = await asyncio.to_thread(_ddgs_search, query)
-    except Exception as e:
-        print(f"search error: {e}")
-        return []
-    return [
-        {"title": r.get("title", ""), "url": r.get("href") or r.get("url", ""), "snippet": r.get("body", "")}
-        for r in raw
-    ]
-
-
-async def open_url(url: str) -> str:
-    try:
-        async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                if r.status != 200:
-                    return f"Ошибка {r.status}"
-                raw = await r.text(errors="ignore")
-    except Exception as e:
-        return f"Не удалось открыть: {e}"
-    raw = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", raw)
-    text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", raw))
-    return re.sub(r"\s+", " ", text).strip()[:3500]
-
-
-# ====================== HTML-ФОРМАТИРОВАНИЕ ======================
-def format_html(text: str) -> str:
-    stash: list[str] = []
-
-    def put(block: str) -> str:
-        stash.append(block)
-        return f"\x00P{len(stash) - 1}\x00"
-
-    def code_block(m):
-        lang, body = (m.group(1) or "").strip(), m.group(2)
-        safe = html.escape(body.rstrip("\n"))
-        if lang:
-            return put(f'<pre><code class="language-{html.escape(lang)}">{safe}</code></pre>')
-        return put(f"<pre>{safe}</pre>")
-
-    text = re.sub(r"```(\w*)\n([\s\S]*?)```", code_block, text)
-    text = re.sub(r"```(\w*)\n?([\s\S]*)$", code_block, text)
-    text = re.sub(r"`([^`\n]+)`", lambda m: put(f"<code>{html.escape(m.group(1))}</code>"), text)
-
-    text = html.escape(text)
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<![\*\w])\*(?!\*)(.+?)(?<!\*)\*(?![\*\w])", r"<i>\1</i>", text)
-    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.MULTILINE)
-    text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
-    text = text.replace("</blockquote>\n<blockquote>", "\n")
-
-    for i, block in enumerate(stash):
-        text = text.replace(f"\x00P{i}\x00", block)
-    return text
-
-
-def split_html(text: str, limit: int = 3900) -> list[str]:
-    parts = []
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        if cut < limit // 2:
-            cut = limit
-        parts.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    parts.append(text)
-    return parts
-
-
-# ====================== КЛАВИАТУРА ======================
-def keyboard(uid: int) -> InlineKeyboardMarkup:
-    r = REASONING.get(uid, False)
-    s = SEARCH.get(uid, True)
-    b = InlineKeyboardBuilder()
-    b.button(text=f"🧠 Думать: {'ВКЛ' if r else 'ВЫКЛ'}", callback_data="toggle:reasoning")
-    b.button(text=f"🌐 Интернет: {'ВКЛ' if s else 'ВЫКЛ'}", callback_data="toggle:search")
-    b.adjust(2)
-    return b.as_markup()
-
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("toggle:"))
-async def on_toggle(cb: types.CallbackQuery):
-    uid = cb.from_user.id
-    what = cb.data.split(":")[1]
-    if what == "reasoning":
-        REASONING[uid] = not REASONING.get(uid, False)
-        note = "🧠 Режим размышлений " + ("включён" if REASONING[uid] else "выключен")
-    else:
-        SEARCH[uid] = not SEARCH.get(uid, True)
-        note = "🌐 Интернет " + ("включён" if SEARCH[uid] else "выключен")
-    try:
-        await cb.message.edit_reply_markup(reply_markup=keyboard(uid))
-    except Exception:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            if fallback:
+                # для config.json: объединяем с дефолтами (недостающие ключи добавятся)
+                merged = json.loads(json.dumps(fallback))
+                merged.update(data)
+                return merged
+            return data  # для state.json
+    except FileNotFoundError:
         pass
-    await cb.answer(note)
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать {path}: {e} — начинаю с чистого файла")
+    return json.loads(json.dumps(fallback))  # deep copy
 
 
-# ====================== КОМАНДЫ ======================
-@dp.message(Command("start"))
-async def cmd_start(m: types.Message):
-    await m.answer(
-        "👋 <b>Привет!</b> Я отвечаю на вопросы, пишу код и умею искать в интернете.\n\n"
-        "🧠 <b>Думать</b> — показывает ход рассуждений, как в Mira\n"
-        "🌐 <b>Интернет</b> — свежие данные из сети\n"
-        "🧹 /clear — забыть историю диалога",
-        parse_mode="HTML",
-        reply_markup=keyboard(m.from_user.id),
-    )
-
-
-@dp.message(Command("clear"))
-async def cmd_clear(m: types.Message):
-    HISTORY.pop(m.from_user.id, None)
-    await m.answer("🧹 История очищена.", reply_markup=keyboard(m.from_user.id))
-
-
-# ====================== ПОИСКОВАЯ ФАЗА ======================
-async def run_search_phase(history: list[dict], user_text: str, ui: dict) -> tuple[str, list[dict]]:
-    sources: list[dict] = []
-    ctx_parts: list[str] = []
-    today = datetime.now().strftime("%d.%m.%Y")
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                f"Сегодня {today}. Ты решаешь, нужен ли поиск в интернете для ответа. "
-                "Если вопрос про актуальные события, цены, курсы, погоду, новости, свежие версии, "
-                "конкретных людей/организации или любые факты, которые могли измениться — вызови web_search "
-                "(можно несколько раз с разными запросами) и при необходимости open_url. "
-                "Если поиск не нужен — ответь одним словом: OK. Сам ответ на вопрос НЕ пиши."
-            ),
-        },
-        *history[-6:],
-        {"role": "user", "content": user_text},
-    ]
-
-    for _ in range(MAX_SEARCH_ROUNDS):
+def first_run_setup(cfg: Dict[str, Any]) -> None:
+    """Интерактивное первичное заполнение токена."""
+    if cfg["bot_token"]:
+        return
+    env = os.environ.get("BOT_TOKEN", "").strip()
+    if env:
+        cfg["bot_token"] = env
+        print("Токен взят из переменной окружения BOT_TOKEN")
+    else:
+        print("=" * 60)
+        print("Первый запуск. Создайте бота у @BotFather и вставьте его токен.")
+        print("(токен будет сохранён в config.json рядом со скриптом)")
+        print("=" * 60)
         try:
-            resp = await deepseek.chat.completions.create(
-                model="deepseek-chat", messages=messages, tools=TOOLS, tool_choice="auto"
-            )
-        except Exception as e:
-            print(f"planner error: {e}")
-            break
-        msg = resp.choices[0].message
-        if not msg.tool_calls:
-            break
+            token = input("Токен (123456789:ABC-DEF…): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nОтмена. Можно вписать токен в config.json вручную.")
+            sys.exit(1)
+        if not re.fullmatch(r"\d+:[\w-]+", token):
+            print("Токен выглядит странно, но сохраню как есть — если что, поправьте config.json")
+        cfg["bot_token"] = token
+    _atomic_write(CONFIG_PATH, cfg)
 
-        messages.append({
-            "role": "assistant",
-            "content": msg.content or "",
-            "tool_calls": [
-                {"id": t.id, "type": "function",
-                 "function": {"name": t.function.name, "arguments": t.function.arguments}}
-                for t in msg.tool_calls
-            ],
-        })
 
-        for t in msg.tool_calls:
+# ----------------------------------------------------------------------------
+# Клиенты провайдеров (три протокола, как в opencode)
+# ----------------------------------------------------------------------------
+
+async def _json_or_error(resp: "aiohttp.ClientResponse") -> Any:
+    if resp.status >= 400:
+        text = (await resp.text())[:300].replace("\n", " ")
+        raise ProviderError(f"HTTP {resp.status}: {text}")
+    try:
+        return await resp.json(content_type=None)
+    except Exception:
+        raise ProviderError(f"HTTP {resp.status}: ответ не JSON")
+
+
+async def _sse_data_lines(resp: "aiohttp.ClientResponse") -> AsyncGenerator[str, None]:
+    """Разбор SSE-потока: отдаёт содержимое строк 'data: ...'."""
+    buf = b""
+    async for chunk in resp.content.iter_any():
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].strip()
+                if payload:
+                    yield payload
+
+
+async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Список моделей провайдера: [(model_id, display_name), ...]"""
+    proto = provider["protocol"]
+    base = provider["base_url"].rstrip("/")
+    key = provider.get("api_key", "")
+
+    if proto == "gemini":
+        url = f"{base}/v1beta/models?pageSize=200"
+        if key:
+            url += f"&key={key}"
+        async with session.get(url) as r:
+            data = await _json_or_error(r)
+        out: List[Tuple[str, str]] = []
+        for m in data.get("models", []):
+            methods = m.get("supportedGenerationMethods") or []
+            if methods and "generateContent" not in methods:
+                continue
+            name = m.get("name", "")
+            mid = name[len("models/"):] if name.startswith("models/") else name
+            if mid:
+                out.append((mid, m.get("displayName") or mid))
+        return out
+
+    if proto == "anthropic":
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        async with session.get(f"{base}/v1/models?limit=1000", headers=headers) as r:
+            data = await _json_or_error(r)
+        out = []
+        for m in data.get("data", []):
+            mid = m.get("id") or ""
+            if mid:
+                out.append((mid, m.get("display_name") or m.get("name") or mid))
+        return out
+
+    # openai-compatible
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    async with session.get(f"{base}/models", headers=headers) as r:
+        data = await _json_or_error(r)
+    items = data.get("data") or data.get("models") or []
+    out = []
+    for m in items:
+        mid = m.get("id") or m.get("name")
+        if mid:
+            out.append((str(mid), str(mid)))
+    return out
+
+
+async def stream_chat(
+    session: "aiohttp.ClientSession",
+    provider: Dict[str, Any],
+    model: str,
+    messages: List[Dict[str, str]],
+) -> AsyncGenerator[str, None]:
+    """Стриминг ответа модели: отдаёт кусочки текста (deltas)."""
+    proto = provider["protocol"]
+    base = provider["base_url"].rstrip("/")
+    key = provider.get("api_key", "")
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    rest = [m for m in messages if m["role"] != "system"]
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=300)
+
+    if proto == "openai":
+        url = f"{base}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        if "openrouter.ai" in base:
+            headers["HTTP-Referer"] = "https://github.com/tg-ai-bot"
+            headers["X-Title"] = "TG AI Bot"
+        payload: Dict[str, Any] = {"model": model, "messages": messages, "stream": True}
+    elif proto == "anthropic":
+        url = f"{base}/v1/messages"
+        headers = {"Content-Type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"}
+        payload = {
+            "model": model,
+            "max_tokens": MAX_TOKENS_ANTHROPIC,
+            "messages": [{"role": m["role"], "content": m["content"]} for m in rest],
+            "stream": True,
+        }
+        if system:
+            payload["system"] = system
+    elif proto == "gemini":
+        url = f"{base}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        if key:
+            url += f"&key={key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [
+                {
+                    "role": "model" if m["role"] == "assistant" else "user",
+                    "parts": [{"text": m["content"]}],
+                }
+                for m in rest
+            ]
+        }
+        if system:
+            payload["systemInstruction"] = {"parts": [{"text": system}]}
+    else:
+        raise ProviderError(f"Неизвестный протокол: {proto}")
+
+    async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status >= 400:
+            text = (await resp.text())[:400].replace("\n", " ")
+            raise ProviderError(f"HTTP {resp.status}: {text}")
+
+        async for line in _sse_data_lines(resp):
+            if line == "[DONE]":
+                break
             try:
-                args = json.loads(t.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
+                obj = json.loads(line)
+            except Exception:
+                continue
 
-            if t.function.name == "web_search":
-                q = str(args.get("query", user_text))[:150]
-                ui["text"] += f"\n🔎 {q}"
-                results = await web_search(q)
-                lines = []
-                for r in results:
-                    sources.append(r)
-                    n = len(sources)
-                    lines.append(f"[{n}] {r['title']}\n{r['url']}\n{r['snippet'][:300]}")
-                    ui["text"] += f"\n   ↳ {r['title'][:60]}"
-                out = "\n\n".join(lines) or "Ничего не найдено."
-                ctx_parts.append(f"Поиск «{q}»:\n{out}")
-
-            elif t.function.name == "open_url":
-                url = str(args.get("url", ""))
-                ui["text"] += f"\n📄 {re.sub(r'^https?://', '', url)[:60]}"
-                page = await open_url(url)
-                sources.append({"title": url, "url": url, "snippet": ""})
-                out = f"Страница [{len(sources)}] {url}:\n{page}"
-                ctx_parts.append(out)
-            else:
-                out = "Неизвестный инструмент"
-
-            messages.append({"role": "tool", "tool_call_id": t.id, "content": out[:6000]})
-
-    return "\n\n".join(ctx_parts), sources
+            if proto == "openai":
+                choices = obj.get("choices") or [{}]
+                delta = (choices[0].get("delta") or {}).get("content")
+                if delta:
+                    yield delta
+            elif proto == "anthropic":
+                t = obj.get("type")
+                if t == "content_block_delta":
+                    d = obj.get("delta") or {}
+                    piece = d.get("text") or d.get("partial_json")
+                    if piece:
+                        yield piece
+                elif t == "error":
+                    raise ProviderError(json.dumps(obj.get("error"), ensure_ascii=False)[:300])
+            else:  # gemini
+                for cand in obj.get("candidates") or []:
+                    for part in ((cand.get("content") or {}).get("parts") or []):
+                        piece = part.get("text")
+                        if piece:
+                            yield piece
 
 
-# ====================== ОСНОВНОЙ ХЕНДЛЕР ======================
-@dp.message()
-async def handle_message(message: types.Message):
-    if message.chat.type != "private" or not message.text:
-        return
+# ----------------------------------------------------------------------------
+# Бот
+# ----------------------------------------------------------------------------
 
-    uid = message.from_user.id
-    lock = LOCKS.setdefault(uid, asyncio.Lock())
-    if lock.locked():
-        await message.answer("⏳ Подожди, я ещё отвечаю на предыдущий вопрос.")
-        return
+class App:
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.state: Dict[str, Any] = load_json(STATE_PATH, {})
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.me: Dict[str, Any] = {}
+        # dialogи мастеров: chat_id -> {"action": "add", "step": ..., "data": {...}}
+        self.dialogs: Dict[int, Dict[str, Any]] = {}
+        # кэш моделей: pid -> (timestamp, [(model_id, name)])
+        self.models_cache: Dict[str, Tuple[float, List[Tuple[str, str]]]] = {}
+        self._save_lock = asyncio.Lock()
 
-    async with lock:
-        await process(message, uid)
+    # ---------- persistence ----------
 
+    def save_config(self) -> None:
+        _atomic_write(CONFIG_PATH, self.cfg)
 
-async def process(message: types.Message, uid: int):
-    chat_id = message.chat.id
-    user_text = message.text
-    draft_id = random.randint(1, 2**31 - 1)
-    use_reasoning = REASONING.get(uid, False)
-    use_search = SEARCH.get(uid, True)
-    history = HISTORY.setdefault(uid, [])
+    def save_state(self) -> None:
+        _atomic_write(STATE_PATH, self.state)
 
-    ui = {"phase": None, "text": "", "frame": 0, "t0": time.monotonic()}
-    think_secs = 0
+    # ---------- telegram api ----------
 
-    if use_search:
-        ui["phase"] = "search"
-    elif use_reasoning:
-        ui["phase"] = "think"
+    async def api(self, method: str, http_timeout: float = 60.0, **params: Any) -> Any:
+        assert self.session is not None
+        url = TG_API.format(token=self.cfg["bot_token"], method=method)
+        try:
+            async with self.session.post(
+                url, json=params, timeout=aiohttp.ClientTimeout(total=http_timeout)
+            ) as r:
+                try:
+                    data = await r.json(content_type=None)
+                except Exception:
+                    raise TgError(f"HTTP {r.status}: не-JSON ответ")
+        except asyncio.TimeoutError:
+            raise TgError("таймаут запроса к Telegram")
+        except aiohttp.ClientError as e:
+            raise TgError(f"сеть: {e}")
+        if not data.get("ok"):
+            raise TgError(str(data.get("description", "unknown error")))
+        return data.get("result")
 
-    async def animate():
-        while ui["phase"] in ("search", "think"):
-            title = "Ищу в интернете" if ui["phase"] == "search" else "Думаю"
-            secs = int(time.monotonic() - ui["t0"])
-            text, ents = render_status(title, secs, ui["frame"], ui["text"])
+    async def send(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text[:MAX_TG],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            kwargs["reply_markup"] = reply_markup
+        return await self.api("sendMessage", **kwargs)
+
+    async def edit(self, chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None) -> None:
+        kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text[:MAX_TG],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        try:
+            await self.api("editMessageText", **kwargs)
+        except TgError as e:
+            if "message is not modified" in str(e).lower():
+                return
+            raise
+
+    # ---------- доступ ----------
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.cfg.get("admins", [])
+
+    def can_chat(self, user_id: int) -> bool:
+        if not self.cfg.get("admins_only"):
+            return True
+        return self.is_admin(user_id)
+
+    # ---------- провайдеры ----------
+
+    def next_pid(self) -> str:
+        i = 1
+        while f"p{i}" in self.cfg["providers"]:
+            i += 1
+        return f"p{i}"
+
+    @staticmethod
+    def mask_key(key: str) -> str:
+        if not key:
+            return "без ключа"
+        if len(key) <= 8:
+            return "•••"
+        return f"{key[:4]}…{key[-4:]}"
+
+    async def get_models(self, pid: str, force: bool = False) -> List[Tuple[str, str]]:
+        """Список моделей с кэшем."""
+        cached = self.models_cache.get(pid)
+        if cached and not force and time.monotonic() - cached[0] < MODELS_TTL:
+            return cached[1]
+        provider = self.cfg["providers"].get(pid)
+        if not provider:
+            return []
+        if self.session is None:
+            raise ProviderError("Бот ещё не готов, попробуйте через минуту")
+        try:
+            models = await fetch_models(self.session, provider)
+        except ProviderError:
+            raise
+        except asyncio.TimeoutError:
+            raise ProviderError("таймаут запроса к провайдеру")
+        except aiohttp.ClientError as e:
+            raise ProviderError(f"ошибка сети: {e}")
+        except RuntimeError as e:
+            # напр. "Session is closed" у aiohttp
+            raise ProviderError(f"ошибка запроса: {e}")
+        self.models_cache[pid] = (time.monotonic(), models)
+        return models
+
+    def model_display(self, pid: str, model_id: str) -> str:
+        cached = self.models_cache.get(pid)
+        if cached:
+            for mid, name in cached[1]:
+                if mid == model_id:
+                    return name
+        return model_id
+
+    def resolve(self, chat_id: int) -> Optional[Tuple[str, Dict[str, Any], str]]:
+        """Модель для чата: явный выбор или глобальная настройка по умолчанию."""
+        st = self.state.get(str(chat_id), {})
+        pid = st.get("provider") or self.cfg["default"].get("provider", "")
+        mid = st.get("model") or self.cfg["default"].get("model", "")
+        provider = self.cfg["providers"].get(pid)
+        if not provider or not provider.get("enabled", True) or not mid:
+            # выбор чата невалиден — пробуем глобальный дефолт
+            pid = self.cfg["default"].get("provider", "")
+            mid = self.cfg["default"].get("model", "")
+            provider = self.cfg["providers"].get(pid)
+            if not provider or not mid:
+                return None
+        return pid, provider, mid
+
+    # ---------- клавиатуры ----------
+
+    @staticmethod
+    def kb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": t, "callback_data": d} for (t, d) in row]
+                for row in rows
+            ]
+        }
+
+    def kb_providers(self, pick_prefix: str, back_data: Optional[str] = None) -> Dict[str, Any]:
+        rows: List[List[Tuple[str, str]]] = []
+        for pid, p in self.cfg["providers"].items():
+            if not p.get("enabled", True):
+                continue
+            cached = self.models_cache.get(pid)
+            n = f" · {len(cached[1])} мод." if cached else ""
+            rows.append([(f"{p['name']} ({pid}){n}", f"{pick_prefix}:{pid}")])
+        if not rows:
+            rows.append([("нет провайдеров — /add", "noop")])
+        if back_data:
+            rows.append([("⬅️ Назад", back_data)])
+        return self.kb(rows)
+
+    async def kb_models(self, pid: str, page: int, pick_prefix: str, back_data: str):
+        try:
+            models = await self.get_models(pid)
+        except ProviderError as e:
+            return None, str(e)
+        if not models:
+            return None, "Провайдер не вернул моделей. Проверьте ключ (/key) и baseURL (/url)."
+
+        pages = max(1, (len(models) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = min(max(0, page), pages - 1)
+        chunk = models[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+        rows: List[List[Tuple[str, str]]] = []
+        for i, (mid, name) in enumerate(chunk):
+            idx = page * PAGE_SIZE + i
+            label = name if len(name) <= 60 else name[:57] + "…"
+            rows.append([(label, f"{pick_prefix}:{pid}:{idx}")])
+        nav: List[Tuple[str, str]] = []
+        if page > 0:
+            nav.append(("⬅️", f"{pick_prefix}pg:{pid}:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(("➡️", f"{pick_prefix}pg:{pid}:{page + 1}"))
+        rows.append(nav)
+        rows.append([("⬅️ К провайдерам", back_data)])
+        return self.kb(rows), None
+
+    def idx_to_model(self, pid: str, idx: int) -> Optional[Tuple[str, str]]:
+        cached = self.models_cache.get(pid)
+        if not cached or idx < 0 or idx >= len(cached[1]):
+            return None
+        return cached[1][idx]
+
+    # ---------- история ----------
+
+    def chat_state(self, chat_id: int) -> Dict[str, Any]:
+        return self.state.setdefault(str(chat_id), {"provider": "", "model": "", "history": []})
+
+    # ---------- генерация ----------
+
+    async def typing_loop(self, chat_id: int, stop: asyncio.Event) -> None:
+        while not stop.is_set():
             try:
-                await bot.send_message_draft(chat_id=chat_id, draft_id=draft_id, text=text, entities=ents)
+                await self.api("sendChatAction", http_timeout=10, chat_id=chat_id, action="typing")
             except Exception:
                 pass
-            ui["frame"] += 1
-            await asyncio.sleep(STATUS_INTERVAL)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                pass
 
-    anim_task = asyncio.create_task(animate()) if ui["phase"] else None
+    async def generate_and_send(self, msg: Dict[str, Any], user_text: str) -> None:
+        chat_id = msg["chat"]["id"]
+        resolved = self.resolve(chat_id)
+        if not resolved:
+            await self.send(
+                chat_id,
+                "⚠️ Модель не выбрана.\n\nИспользуйте /model — выбрать модель\n"
+                "Или /add (если вы админ) — подключить провайдера",
+            )
+            return
+        pid, provider, model_id = resolved
+        display = self.model_display(pid, model_id)
 
-    search_ctx, sources = "", []
-    if use_search:
-        search_ctx, sources = await run_search_phase(history, user_text, ui)
-        ui["phase"] = "think" if use_reasoning else "write"
-        ui["t0"] = time.monotonic()
-        ui["text"] = ""
+        st = self.chat_state(chat_id)
+        history: List[Dict[str, str]] = st.get("history", [])
+        max_hist = int(self.cfg.get("max_history", 24) or 24)
+        sys_prompt = self.cfg.get("system_prompt", "")
 
-    today = datetime.now().strftime("%d.%m.%Y")
-    system = (
-        f"Ты — умный дружелюбный ассистент. Сегодня {today}. Отвечай по существу и кратко, на языке пользователя. "
-        "Код — в блоках ``` с указанием языка. Не пиши код, если вопрос не про код. Используй Markdown."
-    )
-    if search_ctx:
-        system += (
-            "\n\nНиже данные из интернета. Опирайся на них для актуальных фактов и ссылайся на источники "
-            "номерами вида [1], [2]. Если данные противоречат друг другу или их мало — скажи об этом.\n\n"
-            + search_ctx
+        messages: List[Dict[str, str]] = []
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        messages += history
+        messages.append({"role": "user", "content": user_text})
+
+        placeholder = await self.send(chat_id, f"⏳ {provider['name']} · {display}\nДумаю…")
+        msg_id = placeholder["message_id"]
+
+        stop = asyncio.Event()
+        typing_task = asyncio.create_task(self.typing_loop(chat_id, stop))
+        full = ""
+        buf = ""
+        last_edit = 0.0
+        try:
+            async for delta in stream_chat(self.session, provider, model_id, messages):  # type: ignore[arg-type]
+                buf += delta
+                now = time.monotonic()
+                if now - last_edit >= EDIT_EVERY:
+                    full += buf
+                    buf = ""
+                    last_edit = now
+                    shown = (full + buf)[-MAX_TG:]
+                    try:
+                        await self.edit(chat_id, msg_id, shown + " ▌")
+                    except TgError:
+                        pass
+            full += buf
+
+            if not full:
+                await self.edit(chat_id, msg_id, "⚠️ Пустой ответ от модели.")
+                return
+
+            # финальный текст (разбивка длинных ответов)
+            if len(full) <= MAX_TG:
+                await self.edit(chat_id, msg_id, full)
+            else:
+                chunks = []
+                rest = full
+                while rest:
+                    chunks.append(rest[:MAX_TG])
+                    rest = rest[MAX_TG:]
+                await self.edit(chat_id, msg_id, chunks[0])
+                for c in chunks[1:]:
+                    await self.send(chat_id, c)
+
+            # сохраняем историю
+            history = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": full},
+            ]
+            st["history"] = history[-max_hist * 2:]
+            self.save_state()
+        except ProviderError as e:
+            err = f"⚠️ Ошибка провайдера ({provider['name']}):\n{e}"
+            try:
+                await self.edit(chat_id, msg_id, err[:MAX_TG])
+            except TgError:
+                await self.send(chat_id, err[:MAX_TG])
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            err = f"⚠️ Непредвиденная ошибка:\n{e}"
+            try:
+                await self.edit(chat_id, msg_id, err[:MAX_TG])
+            except TgError:
+                await self.send(chat_id, err[:MAX_TG])
+        finally:
+            stop.set()
+            typing_task.cancel()
+            try:
+                await typing_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # ---------- обработка сообщений ----------
+
+    async def on_message(self, msg: Dict[str, Any]) -> None:
+        chat_id = msg["chat"]["id"]
+        uid = (msg.get("from") or {}).get("id", 0)
+        text = msg.get("text", "").strip()
+
+        # первый пользователь в личке становится владельцем
+        if not self.cfg.get("admins") and msg["chat"]["type"] == "private" and uid:
+            self.cfg["admins"] = [uid]
+            self.save_config()
+            await self.send(
+                chat_id,
+                "✅ Вы назначены администратором бота.\n\nНачните с /add — подключите провайдера, "
+                "затем /model — выберите модель.\n\n" + HELP_TEXT,
+            )
+            return
+
+        if not text:
+            await self.send(chat_id, "Пока я понимаю только текстовые сообщения 🙏")
+            return
+
+        # мастер добавления провайдера перехватывает текст
+        dlg = self.dialogs.get(chat_id)
+        if dlg:
+            low = text.lower()
+            if low.startswith("/cancel"):
+                self.dialogs.pop(chat_id, None)
+                await self.send(chat_id, "Мастер отменён.")
+                return
+            if not text.startswith("/") or low.startswith("/skip"):
+                await self.wizard_text(msg, dlg, text)
+                return
+
+        m = re.match(r"^/([a-zA-Z_]+)(?:@\S+)?\s*(.*)$", text, re.S)
+        if m:
+            cmd, args = m.group(1).lower(), m.group(2).strip()
+            handled = await self.dispatch_command(msg, cmd, args)
+            if handled:
+                return
+            await self.send(chat_id, f"Неизвестная команда /{cmd}. Смотрите /help")
+            return
+
+        if not self.can_chat(uid):
+            await self.send(chat_id, "⛔ Общение с ботом ограничено администраторами.")
+            return
+        await self.generate_and_send(msg, text)
+
+    async def dispatch_command(self, msg: Dict[str, Any], cmd: str, args: str) -> bool:
+        chat_id = msg["chat"]["id"]
+        uid = (msg.get("from") or {}).get("id", 0)
+
+        if cmd in ("start", "help"):
+            await self.send(chat_id, HELP_TEXT)
+            return True
+
+        if cmd == "id":
+            await self.send(chat_id, f"Ваш ID: {uid}\nID чата: {chat_id}")
+            return True
+
+        if cmd == "cancel":
+            if self.dialogs.pop(chat_id, None):
+                await self.send(chat_id, "Мастер отменён.")
+            else:
+                await self.send(chat_id, "Нечего отменять.")
+            return True
+
+        if cmd == "model":
+            extra = []
+            st = self.chat_state(chat_id)
+            if st.get("provider") and st.get("model"):
+                extra = [("⟲ Сбросить на модель по умолчанию", "seldef")]
+            kb = self.kb_providers("pv")
+            if extra:
+                kb["inline_keyboard"] = [extra] + kb["inline_keyboard"]
+            await self.send(chat_id, "🧩 Выберите провайдера:", kb)
+            return True
+
+        if cmd == "status":
+            st = self.chat_state(chat_id)
+            r = self.resolve(chat_id)
+            if r:
+                pid, provider, mid = r
+                src = "выбрана в этом чате" if (st.get("model") or st.get("provider")) else "по умолчанию"
+                await self.send(
+                    chat_id,
+                    f"📌 Модель {src}:\n{provider['name']} → {self.model_display(pid, mid)}",
+                )
+            else:
+                await self.send(chat_id, "⚠️ Модель не выбрана. Используйте /model")
+            return True
+
+        if cmd == "clear":
+            st = self.chat_state(chat_id)
+            st["history"] = []
+            self.save_state()
+            await self.send(chat_id, "🧹 История диалога очищена.")
+            return True
+
+        if cmd == "providers":
+            lines = ["🧩 Подключённые провайдеры:"]
+            if not self.cfg["providers"]:
+                lines.append("— пока none. Админ может добавить через /add")
+            for pid, p in self.cfg["providers"].items():
+                cached = self.models_cache.get(pid)
+                n = str(len(cached[1])) + " мод." if cached else "модели не загружены"
+                flag = "" if p.get("enabled", True) else " (выкл)"
+                lines.append(
+                    f"• {pid} — {p['name']} [{PROTOCOL_TITLES.get(p['protocol'], p['protocol'])}]{flag}\n"
+                    f"  {p['base_url']} · ключ: {self.mask_key(p.get('api_key', ''))} · {n}"
+                )
+            await self.send(chat_id, "\n".join(lines))
+            return True
+
+        # ----- дальше только для админов -----
+        if cmd == "add":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            await self.wizard_start(chat_id)
+            return True
+
+        if cmd == "del":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            rows = [
+                [(f"{p['name']} ({pid})", f"del:{pid}")]
+                for pid, p in self.cfg["providers"].items()
+            ] or [[("нет провайдеров", "noop")]]
+            await self.send(chat_id, "🗑 Какого провайдера удалить?", self.kb(rows))
+            return True
+
+        if cmd == "default":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            await self.send(chat_id, "⭐ Провайдер по умолчанию:", self.kb_providers("defpv", "noop"))
+            return True
+
+        if cmd == "key":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            parts = args.split(maxsplit=1)
+            if len(parts) < 2 or parts[0] not in self.cfg["providers"]:
+                await self.send(chat_id, "Формат: /key <id> <новый ключ>\nID смотрите в /providers")
+                return True
+            self.cfg["providers"][parts[0]]["api_key"] = parts[1].strip()
+            self.models_cache.pop(parts[0], None)
+            self.save_config()
+            await self.send(chat_id, f"✅ Ключ {parts[0]} обновлён. Проверить: /model")
+            return True
+
+        if cmd == "url":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            parts = args.split(maxsplit=1)
+            if len(parts) < 2 or parts[0] not in self.cfg["providers"]:
+                await self.send(chat_id, "Формат: /url <id> <baseURL>\nНапример: /url p1 https://openrouter.ai/api/v1")
+                return True
+            url = parts[1].strip().rstrip("/")
+            if not url.startswith(("http://", "https://")):
+                await self.send(chat_id, "URL должен начинаться с http:// или https://")
+                return True
+            self.cfg["providers"][parts[0]]["base_url"] = url
+            self.models_cache.pop(parts[0], None)
+            self.save_config()
+            await self.send(chat_id, f"✅ baseURL {parts[0]} → {url}")
+            return True
+
+        if cmd == "sys":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            if not args or args.lower() in ("off", "выкл"):
+                self.cfg["system_prompt"] = ""
+                self.save_config()
+                await self.send(chat_id, "Системный промпт выключен.")
+            else:
+                self.cfg["system_prompt"] = args
+                self.save_config()
+                await self.send(chat_id, f"✅ Системный промпт сохранён:\n{args[:500]}")
+            return True
+
+        if cmd == "lock":
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Команда только для администраторов.")
+                return True
+            self.cfg["admins_only"] = not self.cfg.get("admins_only", False)
+            self.save_config()
+            state = "включён — писать могут только администраторы" if self.cfg["admins_only"] else "выключен — писать могут все"
+            await self.send(chat_id, f"🔒 Режим «только администраторы» {state}.")
+            return True
+
+        return False
+
+    # ---------- мастер добавления провайдера ----------
+
+    async def wizard_start(self, chat_id: int) -> None:
+        self.dialogs[chat_id] = {"action": "add", "step": "preset", "data": {}}
+        rows: List[List[Tuple[str, str]]] = []
+        preset_items = list(PRESETS.items())
+        for i in range(0, len(preset_items), 2):
+            row = []
+            for pid, p in preset_items[i:i + 2]:
+                row.append((p["name"], f"pre:{pid}"))
+            rows.append(row)
+        await self.send(
+            chat_id,
+            "🧩 Подключение провайдера.\nВыберите пресет — останется вставить только API-ключ:",
+            self.kb(rows),
         )
 
-    model = "deepseek-reasoner" if use_reasoning else "deepseek-chat"
-    messages = [{"role": "system", "content": system}, *history[-HISTORY_LIMIT:],
-                {"role": "user", "content": user_text}]
+    async def wizard_text(self, msg: Dict[str, Any], dlg: Dict[str, Any], text: str) -> None:
+        chat_id = msg["chat"]["id"]
+        data = dlg["data"]
+        step = dlg["step"]
 
-    try:
-        stream = await deepseek.chat.completions.create(model=model, messages=messages, stream=True)
-    except Exception as e:
-        ui["phase"] = None
-        if anim_task:
-            anim_task.cancel()
-        await message.answer(f"⚠️ Ошибка: {html.escape(str(e))}", parse_mode="HTML")
-        return
+        if step == "url":
+            url = text.strip().rstrip("/")
+            if not url.startswith(("http://", "https://")):
+                await self.send(chat_id, "URL должен начинаться с http:// или https://. Попробуйте ещё раз (или /cancel):")
+                return
+            data["base_url"] = url
+            dlg["step"] = "key"
+            await self.send(
+                chat_id,
+                "🔑 Теперь пришлите API-ключ (или /skip, если сервер без ключа):",
+            )
+            return
 
-    answer, reasoning_text = "", ""
-    last_render, last_sent = 0.0, ""
+        if step == "key":
+            key = "" if text.strip().lower().lstrip("/") == "skip" else text.strip()
+            data["api_key"] = key
+            pid = self.next_pid()
+            name = data["name"]
+            base = name
+            n = 2
+            while any(p["name"] == name for p in self.cfg["providers"].values()):
+                name = f"{base} {n}"
+                n += 1
+            self.cfg["providers"][pid] = {
+                "name": name,
+                "protocol": data["protocol"],
+                "base_url": data["base_url"],
+                "api_key": key,
+                "enabled": True,
+            }
+            self.save_config()
+            self.dialogs.pop(chat_id, None)
 
-    try:
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-
-            r = getattr(delta, "reasoning_content", None)
-            if r:
-                reasoning_text += r
-                ui["text"] = reasoning_text
-
-            d = getattr(delta, "content", None)
-            if d:
-                if not answer:
-                    think_secs = int(time.monotonic() - ui["t0"]) if use_reasoning else 0
-                    ui["phase"] = "write"
-                answer += d
-
-                now = time.monotonic()
-                if now - last_render > ANSWER_INTERVAL:
-                    preview = format_html(answer)
-                    if len(preview) <= 4000 and preview != last_sent:
-                        try:
-                            await bot.send_message_draft(
-                                chat_id=chat_id, draft_id=draft_id, text=preview, parse_mode="HTML"
-                            )
-                        except Exception:
-                            try:
-                                plain = re.sub(r"[`*#_~>]", "", answer)[-3800:]
-                                await bot.send_message_draft(chat_id=chat_id, draft_id=draft_id, text=plain)
-                            except Exception:
-                                pass
-                        last_sent, last_render = preview, now
-    except Exception as e:
-        print(f"stream error: {e}")
-    finally:
-        ui["phase"] = "write"
-        if anim_task:
+            status = f"✅ Провайдер «{name}» сохранён (id: {pid})."
+            await self.send(chat_id, f"{status}\nЗагружаю список моделей…")
             try:
-                await anim_task
-            except Exception:
+                models = await self.get_models(pid, force=True)
+                if models:
+                    await self.send(chat_id, f"📦 Загружено моделей: {len(models)}\n\nТеперь: /model — выбрать модель, или /default — сделать её дефолтной.")
+                else:
+                    await self.send(chat_id, "⚠️ Список моделей пуст. Проверьте ключ (/key) и адрес (/url).")
+            except ProviderError as e:
+                await self.send(
+                    chat_id,
+                    f"⚠️ Не удалось получить модели:\n{e}\n\n"
+                    f"Провайдер сохранён. Поправьте ключ: /key {pid} <ключ>\nили адрес: /url {pid} <baseURL>",
+                )
+            return
+
+        self.dialogs.pop(chat_id, None)
+        await self.send(chat_id, "Мастер сброшен. Начните заново: /add")
+
+    # ---------- callback-кнопки ----------
+
+    async def on_callback(self, cq: Dict[str, Any]) -> None:
+        chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+        if not chat_id:
+            return
+        uid = (cq.get("from") or {}).get("id", 0)
+        data = cq.get("data", "")
+
+        try:
+            await self.api("answerCallbackQuery", http_timeout=10, callback_query_id=cq["id"])
+        except TgError:
+            pass
+
+        if data == "noop":
+            return
+
+        msg = cq.get("message") or {}
+
+        # --- мастер /add ---
+        if data.startswith("pre:"):
+            if not self.is_admin(uid):
+                await self.send(chat_id, "⛔ Только для администраторов.")
+                return
+            preset_id = data[4:]
+            preset = PRESETS.get(preset_id)
+            if not preset:
+                return
+            dlg = self.dialogs.setdefault(chat_id, {"action": "add", "data": {}})
+            dlg["action"] = "add"
+            dlg["data"] = {
+                "name": preset["name"],
+                "protocol": preset["protocol"],
+                "base_url": preset["base_url"],
+                "preset_id": preset_id,
+            }
+            if preset["base_url"]:
+                dlg["step"] = "key"
+                docs = f"\nКлюч: {preset['docs']}" if preset.get("docs") else ""
+                await self.edit(
+                    chat_id,
+                    msg.get("message_id", 0),
+                    f"✅ {preset['name']} — {preset['hint']}{docs}\n\n🔑 Пришлите API-ключ (или /skip):",
+                )
+            else:
+                dlg["step"] = "url"
+                await self.edit(
+                    chat_id,
+                    msg.get("message_id", 0),
+                    f"✅ {preset['name']}\nПришлите baseURL, например:\nhttps://api.example.com/v1",
+                )
+            return
+
+        # --- /model ---
+        if data == "seldef":
+            st = self.chat_state(chat_id)
+            st["provider"] = ""
+            st["model"] = ""
+            self.save_state()
+            r = self.resolve(chat_id)
+            if r:
+                await self.edit(chat_id, msg.get("message_id", 0),
+                                f"✅ Будет использоваться модель по умолчанию:\n{r[1]['name']} → {self.model_display(r[0], r[2])}")
+            else:
+                await self.edit(chat_id, msg.get("message_id", 0), "Модель по умолчанию не задана. Админ может задать: /default")
+            return
+
+        if data.startswith("pv:"):
+            pid = data[3:]
+            provider = self.cfg["providers"].get(pid)
+            if not provider:
+                await self.edit(chat_id, msg.get("message_id", 0), "⚠️ Провайдер удалён. Откройте /model заново.")
+                return
+            kb, err = await self.kb_models(pid, 0, "sel", "bk")
+            if err:
+                await self.edit(chat_id, msg.get("message_id", 0), f"⚠️ {err}")
+                return
+            await self.edit(chat_id, msg.get("message_id", 0),
+                            f"🤖 {provider['name']} — выберите модель:", kb)
+            return
+
+        if data.startswith("sel:"):
+            _, pid, idx_s = data.split(":", 2)
+            if pid not in self.cfg["providers"]:
+                await self.edit(chat_id, msg.get("message_id", 0), "⚠️ Провайдер удалён. Откройте /model заново.")
+                return
+            item = self.idx_to_model(pid, int(idx_s))
+            if not item:
+                await self.edit(chat_id, msg.get("message_id", 0), "⚠️ Список устарел, откройте /model заново.")
+                return
+            mid, _name = item
+            st = self.chat_state(chat_id)
+            st["provider"] = pid
+            st["model"] = mid
+            self.save_state()
+            await self.edit(
+                chat_id,
+                msg.get("message_id", 0),
+                f"✅ Модель выбрана:\n{self.cfg['providers'][pid]['name']} → {self.model_display(pid, mid)}\n\nТеперь просто пишите сообщения.",
+            )
+            return
+
+        if data == "bk":
+            await self.edit(chat_id, msg.get("message_id", 0), "🧩 Выберите провайдера:", self.kb_providers("pv"))
+            return
+
+        # --- /default ---
+        if data.startswith("defpv:"):
+            pid = data[6:]
+            kb, err = await self.kb_models(pid, 0, "defsel", "defbk")
+            if err:
+                await self.edit(chat_id, msg.get("message_id", 0), f"⚠️ {err}")
+                return
+            await self.edit(chat_id, msg.get("message_id", 0),
+                            f"⭐ {self.cfg['providers'][pid]['name']} — модель по умолчанию:", kb)
+            return
+
+        if data == "defbk":
+            await self.edit(chat_id, msg.get("message_id", 0), "⭐ Провайдер по умолчанию:", self.kb_providers("defpv", "noop"))
+            return
+
+        if data.startswith("defsel:"):
+            _, pid, idx_s = data.split(":", 2)
+            item = self.idx_to_model(pid, int(idx_s))
+            if not item:
+                await self.edit(chat_id, msg.get("message_id", 0), "⚠️ Список устарел, откройте /default заново.")
+                return
+            mid, _name = item
+            self.cfg["default"] = {"provider": pid, "model": mid}
+            self.save_config()
+            await self.edit(
+                chat_id,
+                msg.get("message_id", 0),
+                f"⭐ Модель по умолчанию:\n{self.cfg['providers'][pid]['name']} → {self.model_display(pid, mid)}",
+            )
+            return
+
+        # --- /del ---
+        if data.startswith("del:"):
+            pid = data[4:]
+            p = self.cfg["providers"].pop(pid, None)
+            self.models_cache.pop(pid, None)
+            if p:
+                if self.cfg["default"].get("provider") == pid:
+                    self.cfg["default"] = {"provider": "", "model": ""}
+                for st in self.state.values():
+                    if st.get("provider") == pid:
+                        st["provider"] = ""
+                        st["model"] = ""
+                self.save_config()
+                self.save_state()
+                await self.edit(chat_id, msg.get("message_id", 0), f"🗑 Провайдер «{p['name']}» удалён.")
+            return
+
+        # --- пагинация (selpg/defpg) ---
+        m = re.match(r"^(sel|defsel)pg:([^:]+):(\d+)$", data)
+        if m:
+            prefix, pid, page = m.group(1), m.group(2), int(m.group(3))
+            pick = "sel" if prefix == "sel" else "defsel"
+            back = "bk" if prefix == "sel" else "defbk"
+            kb, err = await self.kb_models(pid, page, pick, back)
+            if err:
+                await self.edit(chat_id, msg.get("message_id", 0), f"⚠️ {err}")
+                return
+            try:
+                await self.api(
+                    "editMessageReplyMarkup",
+                    chat_id=chat_id,
+                    message_id=msg.get("message_id", 0),
+                    reply_markup=kb,
+                )
+            except TgError:
+                pass
+            return
+
+    # ---------- обработка апдейтов ----------
+
+    async def handle_update(self, up: Dict[str, Any]) -> None:
+        try:
+            if "callback_query" in up:
+                await self.on_callback(up["callback_query"])
+            elif "message" in up:
+                await self.on_message(up["message"])
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ Ошибка обработки апдейта: {e}")
+
+    # ---------- главный цикл ----------
+
+    async def run(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            self.session = session
+
+            me = await self.api("getMe")
+            self.me = me
+            username = me.get("username", "?")
+            print("=" * 60)
+            print(f"✅ Бот @{username} запущен: https://t.me/{username}")
+            print(f"   Конфиг: {CONFIG_PATH}")
+            if not self.cfg["providers"]:
+                print("   Провайдеров пока нет — отправьте боту /add")
+            print("   Остановить: Ctrl+C")
+            print("=" * 60)
+
+            try:
+                await self.api("delete_webhook", http_timeout=15)
+            except TgError:
                 pass
 
-    if not answer:
-        await message.answer("🤷 Модель не вернула текст.", reply_markup=keyboard(uid))
-        return
+            offset = 0
+            while True:
+                try:
+                    updates = await self.api(
+                        "getUpdates",
+                        http_timeout=45,
+                        offset=offset,
+                        timeout=25,
+                        allowed_updates=["message", "callback_query"],
+                    )
+                    for up in updates or []:
+                        offset = up["update_id"] + 1
+                        asyncio.create_task(self.handle_update(up))
+                except TgError as e:
+                    desc = str(e)
+                    if "409" in desc or "webhook" in desc.lower():
+                        print("⚠️ Конфликт (webhook или второй экземпляр). Пробую снять webhook…")
+                        try:
+                            await self.api("delete_webhook", http_timeout=15, drop_pending_updates=True)
+                        except TgError:
+                            pass
+                        await asyncio.sleep(2)
+                    elif "401" in desc or "Unauthorized" in desc:
+                        print("❌ Неверный токен! Исправьте bot_token в config.json и перезапустите.")
+                        await asyncio.sleep(10)
+                    else:
+                        print(f"⚠️ Telegram: {desc}")
+                        await asyncio.sleep(3)
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    print(f"⚠️ Сеть: {e} — переподключаюсь…")
+                    await asyncio.sleep(3)
 
-    history += [{"role": "user", "content": user_text}, {"role": "assistant", "content": answer}]
-    del history[:-HISTORY_LIMIT]
 
-    final = format_html(answer)
-
-    if use_reasoning and reasoning_text.strip():
-        snippet = html.escape(reasoning_text.strip()[-1500:])
-        final = (f"<blockquote expandable><b>🧠 Думал {think_secs}с</b>\n{snippet}</blockquote>\n\n" + final)
-
-    if sources:
-        seen, links = set(), []
-        for i, s in enumerate(sources, 1):
-            if s["url"] in seen or not s["url"]:
-                continue
-            seen.add(s["url"])
-            title = html.escape((s["title"] or s["url"])[:60])
-            links.append(f'{i}. <a href="{html.escape(s["url"], quote=True)}">{title}</a>')
-        if links:
-            final += "\n\n🌐 <b>Источники</b>\n<blockquote expandable>" + "\n".join(links[:8]) + "</blockquote>"
-
-    parts = split_html(final)
-    for i, part in enumerate(parts):
-        kb = keyboard(uid) if i == len(parts) - 1 else None
-        try:
-            await bot.send_message(chat_id, part, parse_mode="HTML", reply_markup=kb,
-                                   link_preview_options=types.LinkPreviewOptions(is_disabled=True))
-        except Exception:
-            await bot.send_message(chat_id, re.sub(r"<[^>]+>", "", part), reply_markup=kb)
-
-
-async def main():
-    print("Бот запущен...")
-    await dp.start_polling(bot)
+def main() -> None:
+    cfg = load_json(CONFIG_PATH, default_config())
+    first_run_setup(cfg)
+    app = App(cfg)
+    try:
+        asyncio.run(app.run())
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
