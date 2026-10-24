@@ -8,12 +8,11 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
       «Ищу в интернете · запрос», «Читаю страницу · сайт», затем текст ответа
       печатается на лету (sendMessageDraft). Если Telegram не поддерживает
       черновики — автоматически включается запасной вариант через редактирование.
-    • 15 СТИЛЕЙ ШРИФТА ответов (меню 🔤 Шрифт или /font): Claude-стиль, markdown,
-      моно, блок кода, жирный, курсив, жирный курсив, подчёркнутый, цитата,
-      спойлер, рукопись, готика, двойной, гротеск, широкий.
-      ВАЖНО: Telegram не умеет подгружать настоящие шрифты — это либо родное
-      оформление (работает и на русском), либо Unicode-алфавиты (меняют латиницу;
-      для кириллицы бот добавляет родное жирное/курсив/подчёркивание).
+    • 4 СТИЛЯ ШРИФТА ответов (меню 🔤 Шрифт или /font): TT Rounds Neue, Bully,
+      Better EB Garamond, Retrac M.
+      ВАЖНО: Telegram не умеет подгружать настоящие шрифты — каждый пункт меню
+      это родное оформление Telegram (работает и на русском), подобранное под
+      характер шрифта: чистый, жирный, курсив, жирный курсив.
     • Кнопки под ответом: 🔄 Ещё раз · 🔤 Шрифт · 🤖 Сменить модель.
     • Фото (vision) и файлы (код, txt, csv, json…), веб-поиск и чтение страниц
       (tool-calling во всех трёх протоколах), все команды — кнопками под полем ввода.
@@ -90,69 +89,41 @@ UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
 
 # ----------------------------------------------------------------------------
-# Шрифты (15 стилей)
+# Шрифты (4 стиля)
 # ----------------------------------------------------------------------------
 
 FONTS: Dict[str, str] = {
-    "claude": "🟠 Claude — чистый стиль",
-    "rich": "🖋 Обычный (markdown)",
-    "mono": "💻 Моноширинный",
-    "pre": "🧱 Блок кода",
-    "bold": "🅱️ Жирный",
-    "italic": "✏️ Курсив",
-    "bolditalic": "🔥 Жирный курсив",
-    "underline": "➖ Подчёркнутый",
-    "quote": "💬 Цитата",
-    "spoiler": "🫥 Спойлер",
-    "script": "🪶 Рукопись 𝓢𝓬𝓻𝓲𝓹𝓽",
-    "fraktur": "🏰 Готика 𝕱𝖗𝖆𝖐𝖙𝖚𝖗",
-    "double": "🔳 Двойной 𝔻𝕠𝕦𝕓𝕝𝕖",
-    "sans": "🔠 Гротеск 𝗦𝗮𝗻𝘀",
-    "wide": "🌐 Широкий ｗｉｄｅ",
+    "rounds": "⭕ TT Rounds Neue",
+    "bully": "🅱️ Bully",
+    "garamond": "📖 Better EB Garamond",
+    "retrac": "🔥 Retrac M",
 }
 FONT_ORDER = list(FONTS)
-DEFAULT_FONT = "claude"
+DEFAULT_FONT = "rounds"
+# Telegram не грузит файлы шрифтов, поэтому каждому шрифту соответствует родной стиль:
+#   rounds   — чистый округлый гротеск        → чистый стиль без лишней разметки
+#   bully    — плотный акцидентный             → жирный
+#   garamond — классическая книжная антиква    → курсив
+#   retrac   — выразительная антиква           → жирный курсив
+FONT_STYLE: Dict[str, str] = {
+    "rounds": "claude",
+    "bully": "bold",
+    "garamond": "italic",
+    "retrac": "bolditalic",
+}
 FONT_ALIASES = {
-    "клод": "claude", "клауд": "claude", "чистый": "claude",
-    "обычный": "rich", "маркдаун": "rich", "markdown": "rich",
-    "моно": "mono", "моноширинный": "mono", "код": "pre", "блок": "pre",
-    "жирный": "bold", "курсив": "italic", "жирныйкурсив": "bolditalic",
-    "подчёркнутый": "underline", "подчеркнутый": "underline",
-    "цитата": "quote", "спойлер": "spoiler",
-    "рукопись": "script", "готика": "fraktur", "двойной": "double",
-    "гротеск": "sans", "широкий": "wide",
-    "простой": "rich", "plain": "rich",
+    "rounds": "rounds", "tt": "rounds", "ttrounds": "rounds", "раундс": "rounds",
+    "bully": "bully", "булли": "bully",
+    "garamond": "garamond", "гарамонд": "garamond", "ebgaramond": "garamond",
+    "retrac": "retrac", "ретрак": "retrac", "retracm": "retrac",
+    # старые ключи — чтобы сохранённые настройки и переменная FONT не ломались
+    "claude": "rounds", "клод": "rounds", "клауд": "rounds", "чистый": "rounds",
+    "rich": "rounds", "обычный": "rounds", "простой": "rounds",
+    "bold": "bully", "жирный": "bully",
+    "italic": "garamond", "курсив": "garamond",
+    "bolditalic": "retrac", "жирныйкурсив": "retrac",
 }
 
-
-def _mk_alpha(up: int, lo: int, dg: Optional[int] = None,
-              exc: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    m: Dict[str, str] = {}
-    for i in range(26):
-        m[chr(65 + i)] = chr(up + i)
-        m[chr(97 + i)] = chr(lo + i)
-    if dg is not None:
-        for i in range(10):
-            m[chr(48 + i)] = chr(dg + i)
-    if exc:
-        m.update(exc)
-    return m
-
-
-# Unicode-алфавиты (Mathematical Alphanumeric / Fullwidth) — меняют только латиницу и цифры
-UNI_MAPS: Dict[str, Dict[str, str]] = {
-    "script": _mk_alpha(0x1D4D0, 0x1D4EA),
-    "fraktur": _mk_alpha(0x1D56C, 0x1D586),
-    "double": _mk_alpha(0x1D538, 0x1D552, 0x1D7D8,
-                        {"C": "ℂ", "H": "ℍ", "N": "ℕ", "P": "ℙ", "Q": "ℚ", "R": "ℝ", "Z": "ℤ"}),
-    "sans": _mk_alpha(0x1D5D4, 0x1D5EE, 0x1D7EC),
-    "wide": _mk_alpha(0xFF21, 0xFF41, 0xFF10),
-}
-# чем оформить КИРИЛЛИЦУ в Unicode-стилях (в них нет русских букв)
-UNI_CYR_TAG: Dict[str, Optional[str]] = {
-    "script": "i", "fraktur": "b", "double": "u", "sans": "b", "wide": None,
-}
-_CYR = re.compile(r"[\u0400-\u04FF](?:[\u0400-\u04FF ,.\-]*[\u0400-\u04FF])?")
 
 # --- reply-клавиатура: все команды кнопками, по разделам ---
 MENU_BTN = {
@@ -284,7 +255,7 @@ HELP_HTML = "\n".join([
     "/id — показать ID",
     "",
     "<b>Оформление</b>",
-    "/font — 15 стилей шрифта ответов (Claude, моно, готика, рукопись…)",
+    "/font — 4 стиля шрифта ответов (TT Rounds Neue, Bully, Better EB Garamond, Retrac M)",
     "",
     "<b>Провайдеры (админ)</b>",
     "/providers — список провайдеров",
@@ -1082,7 +1053,7 @@ def _is_tools_error(err: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# Оформление ответов: markdown → Telegram HTML и 15 шрифтов
+# Оформление ответов: markdown → Telegram HTML и 4 шрифта
 # ----------------------------------------------------------------------------
 
 _SEP_ROW = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
@@ -1195,49 +1166,18 @@ def _wrap(tag: str) -> Callable[[str, List[str]], str]:
     return f
 
 
-def _uni(mapping: Dict[str, str], cyr_tag: Optional[str]) -> Callable[[str, List[str]], str]:
-    def f(t: str, st: List[str]) -> str:
-        res: List[str] = []
-        for p in re.split(r"(&#?\w+;)", t):  # html-сущности не трогаем
-            if re.fullmatch(r"&#?\w+;", p):
-                res.append(p)
-                continue
-            p = "".join(mapping.get(c, c) for c in p)
-            if cyr_tag and cyr_tag not in st:
-                p = _CYR.sub(lambda m: f"<{cyr_tag}>{m.group(0)}</{cyr_tag}>", p)
-            res.append(p)
-        return "".join(res)
-    return f
-
-
-def fmt_mono(text: str) -> str:
-    text = re.sub(r"```\w*\n?", "", text)
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.S)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)
-    return f"<code>{html.escape(text.strip(), quote=False)}</code>"
-
-
-def fmt_pre(text: str) -> str:
-    text = re.sub(r"```\w*\n?", "", text)
-    return f"<pre>{html.escape(text.strip(), quote=False)}</pre>"
-
-
 def render(text: str, font: str) -> str:
-    """Текст ответа → HTML в выбранном из 15 стилей."""
-    if font == "mono":
-        return fmt_mono(text)
-    if font == "pre":
-        return fmt_pre(text)
-    base = md_to_html(text, pretty=(font == "claude"))
-    if font in ("claude", "rich") or font not in FONTS:
+    """Текст ответа → HTML в выбранном из 4 стилей."""
+    style = FONT_STYLE.get(font, "claude")
+    base = md_to_html(text, pretty=(style == "claude"))
+    if style == "claude":
         return base
-    simple = {"bold": "b", "italic": "i", "underline": "u", "quote": "blockquote", "spoiler": "tg-spoiler"}
-    if font in simple:
-        return map_runs(base, _wrap(simple[font]))
-    if font == "bolditalic":
+    if style == "bold":
+        return map_runs(base, _wrap("b"))
+    if style == "italic":
+        return map_runs(base, _wrap("i"))
+    if style == "bolditalic":
         return map_runs(map_runs(base, _wrap("b")), _wrap("i"))
-    if font in UNI_MAPS:
-        return map_runs(base, _uni(UNI_MAPS[font], UNI_CYR_TAG.get(font)))
     return base
 
 
@@ -1758,7 +1698,7 @@ class App:
         """Отправить итоговый ответ в выбранном шрифте: длинные ответы режутся на части
         с сохранением разметки; при ошибке разметки уходит простой текст."""
         font = self.font_of(chat_id)
-        limit = 1700 if font in UNI_MAPS else 3500   # Unicode-буквы весят по 2 символа
+        limit = 3500
         chunks = split_text(text, limit)
         cur_mid = mid
         for i, ch in enumerate(chunks):
@@ -2019,9 +1959,9 @@ class App:
         await self.send(
             chat_id,
             f"🔤 Шрифт ответов ИИ — сейчас: {FONTS[cur]}\n\n"
-            "Выберите из 15 стилей — после выбора пришлю пример.\n"
-            "ℹ️ Unicode-стили (рукопись, готика, двойной, гротеск, широкий) меняют латиницу; "
-            "русский текст в них оформляется жирным/курсивом/подчёркиванием.",
+            "Выберите из 4 шрифтов — после выбора пришлю пример.\n"
+            "ℹ️ Telegram не подгружает файлы шрифтов, поэтому каждый шрифт передаётся "
+            "родным оформлением (работает и на русском).",
             self.kb_font(cur), attach_kb=True)
 
     async def dispatch_command(self, msg: Dict[str, Any], cmd: str, args: str) -> bool:
@@ -2431,7 +2371,7 @@ class App:
             await self.generate_and_send(fake, txt)
             return
 
-        # --- выбор шрифта (15 стилей) ---
+        # --- выбор шрифта (4 стиля) ---
         if data.startswith("font:"):
             f = data[5:]
             if f in FONTS:
