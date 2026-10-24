@@ -1,6 +1,8 @@
 # Render Blueprint — деплой бота одной кнопкой:
 #   Render → New + → Blueprint → выберите репозиторий с этими файлами.
-# Затем во время создания заполните BOT_TOKEN (и по желанию ADMIN_IDS).
+# При создании заполните переменные (все, кроме BOT_TOKEN, можно оставить пустыми).
+#
+# Вся конфигурация живёт в env — config.json на Render не нужен.
 services:
   - type: web
     name: tg-ai-bot
@@ -10,10 +12,20 @@ services:
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        sync: false          # спросит при создании (токен от @BotFather)
+        sync: false          # токен от @BotFather (обязательно)
       - key: ADMIN_IDS
-        sync: false          # ваш Telegram ID (узнать: @userinfobot), можно оставить пустым
+        sync: false          # ваш Telegram ID (узнать: @userinfobot)
+      # Провайдеры из env, примеры:
+      #   PROVIDER_1=openrouter:sk-or-v1-...
+      #   PROVIDER_2=deepseek:sk-...
+      #   PROVIDER_3=Мой прокси|openai|https://api.example.com/v1|key123
+      - key: PROVIDER_1
+        sync: false
+      - key: PROVIDER_2
+        sync: false
+      - key: DEFAULT_MODEL   # модель по умолчанию, напр. deepseek-chat, openai/gpt-4o-mini
+        sync: false
       - key: SYSTEM_PROMPT
-        sync: false          # системный промпт, можно оставить пустым
+        sync: false
       - key: MAX_HISTORY
         value: "24"

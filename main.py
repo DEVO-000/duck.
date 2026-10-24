@@ -414,10 +414,45 @@ def sync_env_providers(cfg: Dict[str, Any]) -> None:
     print("Провайдеры из окружения: " + ", ".join(names))
 
 
+def clean_secret(s: str) -> str:
+    """Убрать пробелы по краям и случайные обрамляющие кавычки.
+
+    Частая ошибка при вставке значений в дашборд Render — значение вида
+    "123:ABC" вместе с кавычками; Telegram тогда видит мусор в токене.
+    """
+    s = (s or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def tg_hint(err: str) -> str:
+    """Человекочитаемая подсказка по ошибке Telegram Bot API (для логов при старте)."""
+    low = err.lower()
+    if "401" in err or "unauthorized" in low:
+        return ("Токен неверного формата — должен быть вида 123456789:ABC-DEF… "
+                "(без кавычек и пробелов). Проверьте BOT_TOKEN.")
+    if "404" in err or "not found" in low:
+        return ("Telegram не находит бота с этим токеном. Проверьте бота у @BotFather (/mybots); "
+                "если токен отозван — выпустите новый (/token) и обновите BOT_TOKEN в Render.")
+    if "409" in err or "conflict" in low:
+        return ("Конфликт: webhook или getUpdates заняты другим экземпляром бота. "
+                "Остановите второй экземпляр и перезапустите сервис.")
+    if "429" in err or "too many requests" in low:
+        return "Слишком много запросов к Telegram. Подождите пару минут и сделайте Manual Deploy → Restart."
+    if "400" in err or "bad request" in low:
+        return ("Telegram отклонил параметры запроса (обычно URL вебхука). Проверьте, что "
+                "RENDER_EXTERNAL_URL / WEBHOOK_URL — валидный https-адрес без опечаток.")
+    return "Проверьте BOT_TOKEN и настройки сервиса, затем Manual Deploy → Restart."
+
+
 def first_run_setup(cfg: Dict[str, Any]) -> None:
     """Токен: приоритет у окружения BOT_TOKEN, иначе интерактивно."""
-    env = os.environ.get("BOT_TOKEN", "").strip()
+    env = clean_secret(os.environ.get("BOT_TOKEN", ""))
     if env:
+        if not re.fullmatch(r"\d+:[\w-]+", env):
+            print("⚠️ BOT_TOKEN не похож на токен Telegram (вида 123456789:ABC-DEF…). "
+                  "Проверьте переменную — нет ли лишних символов, кавычек или пробелов.")
         if cfg.get("bot_token") != env:
             first = not cfg.get("bot_token")
             cfg["bot_token"] = env
@@ -435,7 +470,7 @@ def first_run_setup(cfg: Dict[str, Any]) -> None:
     print("(токен будет сохранён в config.json рядом со скриптом)")
     print("=" * 60)
     try:
-        token = input("Токен (123456789:ABC-DEF…): ").strip()
+        token = clean_secret(input("Токен (123456789:ABC-DEF…): "))
     except (EOFError, KeyboardInterrupt):
         print("\nОтмена. Можно вписать токен в config.json вручную.")
         sys.exit(1)
@@ -654,6 +689,24 @@ class App:
         if not data.get("ok"):
             raise TgError(str(data.get("description", "unknown error")))
         return data.get("result")
+
+    async def api_with_retry(self, method: str, attempts: int = 3, delay: float = 4.0,
+                             fatal_markers: Tuple[str, ...] = (), **params: Any) -> Any:
+        """api() с повторами: transient-сбои сети/Telegram переживаются,
+        ошибки из fatal_markers (невалидный токен, плохие параметры) — сразу наверх."""
+        err: Optional[TgError] = None
+        for i in range(max(1, attempts)):
+            try:
+                return await self.api(method, **params)
+            except TgError as e:
+                err = e
+                s = str(e).lower()
+                if any(m.lower() in s for m in fatal_markers):
+                    raise
+                if i < attempts - 1:
+                    print(f"⚠️ Telegram {method}: {e} — повтор {i + 2}/{attempts} через {delay:.0f}с")
+                    await asyncio.sleep(delay)
+        raise err  # type: ignore[misc]
 
     async def send(self, chat_id: int, text: str, reply_markup: Optional[Dict] = None) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {
@@ -1399,9 +1452,12 @@ class App:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
             try:
-                me = await self.api("getMe")
+                me = await self.api_with_retry(
+                    "getMe", attempts=3, delay=3.0,
+                    fatal_markers=("401", "unauthorized", "404", "not found"),
+                )
             except TgError as e:
-                sys.exit(f"❌ Telegram отклонил токен: {e}")
+                sys.exit(f"❌ Telegram отклонил токен: {e}\n💡 {tg_hint(str(e))}")
 
             async def telegram_update(request: web.Request) -> web.Response:
                 if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
@@ -1430,8 +1486,9 @@ class App:
             await site.start()
 
             try:
-                await self.api(
-                    "set_webhook",
+                await self.api_with_retry(
+                    "setWebhook", attempts=4, delay=6.0,
+                    fatal_markers=("400", "bad request"),
                     http_timeout=30,
                     url=f"{base_url}/{hook_path}",
                     secret_token=secret,
@@ -1441,7 +1498,8 @@ class App:
                 )
             except TgError as e:
                 await runner.cleanup()
-                sys.exit(f"❌ Не удалось зарегистрировать webhook: {e}")
+                sys.exit(f"❌ Не удалось зарегистрировать webhook: {e}\n💡 {tg_hint(str(e))}\n"
+                         "   (если повторяется — Manual Deploy → Restart в дашборде Render)")
 
             print("=" * 60)
             print(f"✅ Бот @{me.get('username', '?')} запущен (webhook): https://t.me/{me.get('username', '?')}")
@@ -1471,7 +1529,10 @@ class App:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
 
-            me = await self.api("getMe")
+            try:
+                me = await self.api("getMe")
+            except TgError as e:
+                sys.exit(f"❌ Telegram отклонил токен: {e}\n💡 {tg_hint(str(e))}")
             self.me = me
             username = me.get("username", "?")
             print("=" * 60)
@@ -1483,7 +1544,7 @@ class App:
             print("=" * 60)
 
             try:
-                await self.api("delete_webhook", http_timeout=15)
+                await self.api("deleteWebhook", http_timeout=15)
             except TgError:
                 pass
 
@@ -1505,7 +1566,7 @@ class App:
                     if "409" in desc or "webhook" in desc.lower():
                         print("⚠️ Конфликт (webhook или второй экземпляр). Пробую снять webhook…")
                         try:
-                            await self.api("delete_webhook", http_timeout=15, drop_pending_updates=True)
+                            await self.api("deleteWebhook", http_timeout=15, drop_pending_updates=True)
                         except TgError:
                             pass
                         await asyncio.sleep(2)
