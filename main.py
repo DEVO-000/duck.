@@ -8,11 +8,6 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
       «Ищу в интернете · запрос», «Читаю страницу · сайт», затем текст ответа
       печатается на лету (sendMessageDraft). Если Telegram не поддерживает
       черновики — автоматически включается запасной вариант через редактирование.
-    • 4 СТИЛЯ ШРИФТА ответов (меню 🔤 Шрифт или /font): TT Rounds Neue, Bully,
-      Better EB Garamond, Retrac M.
-      ВАЖНО: Telegram не умеет подгружать настоящие шрифты — каждый пункт меню
-      это родное оформление Telegram (работает и на русском), подобранное под
-      характер шрифта: чистый, жирный, курсив, жирный курсив.
     • Кнопки под ответом: 🔄 Ещё раз · 🔤 Шрифт · 🤖 Сменить модель.
     • Фото (vision) и файлы (код, txt, csv, json…), веб-поиск и чтение страниц
       (tool-calling во всех трёх протоколах), все команды — кнопками под полем ввода.
@@ -22,10 +17,10 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
     BOT_TOKEN=123:ABC python main.py
 
 На Render (Web Service) — переменные окружения:
-    BOT_TOKEN, ADMIN_IDS, PROVIDER_1..N (пресет:ключ или Имя|протокол|URL|ключ),
+    BOT_TOKEN, PROVIDER_1..N (пресет:ключ или Имя|протокол|URL|ключ),
     CUSTOM_URL / CUSTOM_KEY / CUSTOM_NAME / CUSTOM_PROTOCOL / CUSTOM_MODEL,
-    DEFAULT_MODEL, DEFAULT_PROVIDER, SYSTEM_PROMPT, MAX_HISTORY, ADMIN_ONLY,
-    WEB_TOOLS (0/1), FONT (ключ шрифта, по умолчанию claude),
+    DEFAULT_MODEL, DEFAULT_PROVIDER, SYSTEM_PROMPT, MAX_HISTORY,
+    WEB_TOOLS (0/1),
     CUSTOM_EMOJI_ID (id кастомного эмодзи для анимации; пусто = обычное 💭).
     Render сам задаёт PORT и RENDER_EXTERNAL_URL — бот поднимет webhook.
 
@@ -88,71 +83,26 @@ MAX_TOOL_ROUNDS = 4
 UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120 Mobile Safari/537.36"}
 
-# ----------------------------------------------------------------------------
-# Шрифты (4 стиля)
-# ----------------------------------------------------------------------------
-
-FONTS: Dict[str, str] = {
-    "rounds": "⭕ TT Rounds Neue",
-    "bully": "🅱️ Bully",
-    "garamond": "📖 Better EB Garamond",
-    "retrac": "🔥 Retrac M",
-}
-FONT_ORDER = list(FONTS)
-DEFAULT_FONT = "rounds"
-# Telegram не грузит файлы шрифтов, поэтому каждому шрифту соответствует родной стиль:
-#   rounds   — чистый округлый гротеск        → чистый стиль без лишней разметки
-#   bully    — плотный акцидентный             → жирный
-#   garamond — классическая книжная антиква    → курсив
-#   retrac   — выразительная антиква           → жирный курсив
-FONT_STYLE: Dict[str, str] = {
-    "rounds": "claude",
-    "bully": "bold",
-    "garamond": "italic",
-    "retrac": "bolditalic",
-}
-FONT_ALIASES = {
-    "rounds": "rounds", "tt": "rounds", "ttrounds": "rounds", "раундс": "rounds",
-    "bully": "bully", "булли": "bully",
-    "garamond": "garamond", "гарамонд": "garamond", "ebgaramond": "garamond",
-    "retrac": "retrac", "ретрак": "retrac", "retracm": "retrac",
-    # старые ключи — чтобы сохранённые настройки и переменная FONT не ломались
-    "claude": "rounds", "клод": "rounds", "клауд": "rounds", "чистый": "rounds",
-    "rich": "rounds", "обычный": "rounds", "простой": "rounds",
-    "bold": "bully", "жирный": "bully",
-    "italic": "garamond", "курсив": "garamond",
-    "bolditalic": "retrac", "жирныйкурсив": "retrac",
-}
-
-
 # --- reply-клавиатура: все команды кнопками, по разделам ---
 MENU_BTN = {
     "🤖 Модель": "/model",
     "📊 Статус": "/status",
-    "🔤 Шрифт": "/font",
     "🌐 Поиск": "/web",
     "➕ Провайдер": "/add",
     "🧩 Провайдеры": "/providers",
     "⭐ Дефолт": "/default",
     "🗑 Удалить": "/del",
     "💬 Промпт": "/sys",
-    "🔒 Только админы": "/lock",
     "🧹 Очистить": "/clear",
     "📋 Помощь": "/help",
     "🆔 Мой ID": "/id",
     "✖️ Отмена": "/cancel",
 }
-KB_USER_ROWS = [
+KB_ROWS = [
     ["🤖 Модель", "📊 Статус"],
-    ["🔤 Шрифт", "🧹 Очистить"],
-    ["📋 Помощь", "🆔 Мой ID"],
-]
-KB_ADMIN_ROWS = [
-    ["🤖 Модель", "📊 Статус"],
-    ["🔤 Шрифт", "🌐 Поиск"],
     ["➕ Провайдер", "🧩 Провайдеры"],
     ["⭐ Дефолт", "🗑 Удалить"],
-    ["💬 Промпт", "🔒 Только админы"],
+    ["🌐 Поиск", "💬 Промпт"],
     ["🧹 Очистить", "📋 Помощь"],
     ["🆔 Мой ID", "✖️ Отмена"],
 ]
@@ -201,14 +151,6 @@ PROTOCOL_TITLES = {
 }
 
 PRESETS: Dict[str, Dict[str, str]] = {
-    "custom-auto": {"name": "🔗 Своя ссылка (авто)", "protocol": "", "base_url": "", "docs": "",
-                    "hint": "Просто URL — бот сам определит тип API"},
-    "custom-openai": {"name": "Свой сервер (OpenAI-compatible)", "protocol": "openai", "base_url": "",
-                      "docs": "", "hint": "Любой ваш URL: vLLM, LM Studio, прокси…"},
-    "custom-anthropic": {"name": "Свой сервер (Anthropic-compatible)", "protocol": "anthropic",
-                         "base_url": "", "docs": "", "hint": "Любой клон Claude API"},
-    "custom-gemini": {"name": "Свой сервер (Gemini-compatible)", "protocol": "gemini", "base_url": "",
-                      "docs": "", "hint": "Любой прокси Gemini API"},
     "openrouter": {"name": "OpenRouter", "protocol": "openai", "base_url": "https://openrouter.ai/api/v1",
                    "docs": "https://openrouter.ai/keys", "hint": "Сотни моделей одним ключом"},
     "openai": {"name": "OpenAI", "protocol": "openai", "base_url": "https://api.openai.com/v1",
@@ -239,6 +181,30 @@ PRESETS: Dict[str, Dict[str, str]] = {
                  "docs": "https://cloud.cerebras.ai", "hint": "Сверхбыстрый инференс"},
 }
 
+# Как пользователь может назвать провайдера (кроме id и названия из PRESETS)
+PROVIDER_ALIASES = {
+    "gpt": "openai", "chatgpt": "openai", "claude": "anthropic", "gemini": "google",
+    "googleai": "google", "googlegemini": "google", "glm": "zai", "zhipu": "zai",
+    "zai": "zai", "grok": "xai", "kimi": "moonshot", "mistralai": "mistral",
+    "togetherai": "together", "fireworksai": "fireworks",
+}
+
+
+def find_preset(name: str) -> Optional[str]:
+    """Найти пресет по имени, которое вписал пользователь (id, название или псевдоним)."""
+    key = re.sub(r"[^a-z0-9а-я]", "", name.lower())
+    if not key:
+        return None
+    if key in PROVIDER_ALIASES:
+        return PROVIDER_ALIASES[key]
+    for pid, p in PRESETS.items():
+        if key == re.sub(r"[^a-z0-9а-я]", "", pid.lower()):
+            return pid
+        if key == re.sub(r"[^a-z0-9а-я]", "", p["name"].lower()):
+            return pid
+    return None
+
+
 # Справка в HTML (спецсимволы экранированы вручную)
 HELP_HTML = "\n".join([
     "<b>🤖 AI-бот с подключаемыми провайдерами</b>",
@@ -254,21 +220,17 @@ HELP_HTML = "\n".join([
     "/clear — очистить историю диалога",
     "/id — показать ID",
     "",
-    "<b>Оформление</b>",
-    "/font — 4 стиля шрифта ответов (TT Rounds Neue, Bully, Better EB Garamond, Retrac M)",
-    "",
-    "<b>Провайдеры (админ)</b>",
+    "<b>Провайдеры</b>",
     "/providers — список провайдеров",
-    "/add — подключить провайдера (своя ссылка или пресет)",
+    "/add — подключить провайдера (впишите его имя, например openai или deepseek)",
     "/del — удалить провайдера",
     "/default — модель по умолчанию",
     "/key &lt;id&gt; &lt;ключ&gt; — сменить API-ключ",
     "/url &lt;id&gt; &lt;url&gt; — сменить baseURL",
     "/web — вкл/выкл веб-инструменты",
     "",
-    "<b>Настройки (админ)</b>",
+    "<b>Настройки</b>",
     "/sys — системный промпт (/sys &lt;текст&gt; · /sys off)",
-    "/lock — режим «только администраторы»",
     "",
     "<b>Прочее</b>",
     "/get_id &lt;набор&gt; — custom_emoji_id стикеров набора",
@@ -301,12 +263,9 @@ def detect_protocol(url: str) -> str:
 def default_config() -> Dict[str, Any]:
     return {
         "bot_token": "",
-        "admins": [],
-        "admins_only": False,
         "system_prompt": "",
         "max_history": 24,
         "web_tools": True,
-        "font": DEFAULT_FONT,
         "default": {"provider": "", "model": ""},
         "providers": {},
     }
@@ -346,12 +305,6 @@ def clean_secret(s: str) -> str:
 
 def apply_env_overrides(cfg: Dict[str, Any]) -> None:
     applied: List[str] = []
-    ids_raw = os.environ.get("ADMIN_IDS", "").strip()
-    if ids_raw:
-        ids = [int(x) for x in re.split(r"[,;\s]+", ids_raw) if x.lstrip("-").isdigit()]
-        if ids:
-            cfg["admins"] = ids
-            applied.append("ADMIN_IDS")
     sp = os.environ.get("SYSTEM_PROMPT", "").strip()
     if sp:
         cfg["system_prompt"] = sp
@@ -360,13 +313,6 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> None:
     if mh.isdigit():
         cfg["max_history"] = max(2, int(mh))
         applied.append("MAX_HISTORY")
-    ao = os.environ.get("ADMIN_ONLY", "").strip().lower()
-    if ao in ("1", "true", "yes"):
-        cfg["admins_only"] = True
-        applied.append("ADMIN_ONLY=1")
-    elif ao in ("0", "false", "no"):
-        cfg["admins_only"] = False
-        applied.append("ADMIN_ONLY=0")
     wt = os.environ.get("WEB_TOOLS", "").strip().lower()
     if wt in ("1", "true", "yes"):
         cfg["web_tools"] = True
@@ -374,13 +320,6 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> None:
     elif wt in ("0", "false", "no"):
         cfg["web_tools"] = False
         applied.append("WEB_TOOLS=0")
-    ft = os.environ.get("FONT", "").strip().lower()
-    ft = FONT_ALIASES.get(ft, ft)
-    if ft in FONTS:
-        cfg["font"] = ft
-        applied.append(f"FONT={ft}")
-    if cfg.get("font") not in FONTS:
-        cfg["font"] = DEFAULT_FONT
     if applied:
         print("Из окружения применены: " + ", ".join(applied))
 
@@ -1166,19 +1105,9 @@ def _wrap(tag: str) -> Callable[[str, List[str]], str]:
     return f
 
 
-def render(text: str, font: str) -> str:
-    """Текст ответа → HTML в выбранном из 4 стилей."""
-    style = FONT_STYLE.get(font, "claude")
-    base = md_to_html(text, pretty=(style == "claude"))
-    if style == "claude":
-        return base
-    if style == "bold":
-        return map_runs(base, _wrap("b"))
-    if style == "italic":
-        return map_runs(base, _wrap("i"))
-    if style == "bolditalic":
-        return map_runs(map_runs(base, _wrap("b")), _wrap("i"))
-    return base
+def render(text: str) -> str:
+    """Текст ответа → Telegram HTML."""
+    return md_to_html(text, pretty=True)
 
 
 def strip_html(h: str) -> str:
@@ -1212,13 +1141,6 @@ def split_text(text: str, limit: int) -> List[str]:
     if cur.strip():
         chunks.append(cur)
     return chunks
-
-
-FONT_SAMPLE = ("# Пример шрифта\n"
-               "Привет, мир! Hello, World 2026.\n\n"
-               "**Жирный**, *курсив*, `код` и [ссылка](https://example.com).\n"
-               "- первый пункт\n- второй пункт\n\n"
-               "> цитата для проверки")
 
 
 # ----------------------------------------------------------------------------
@@ -1466,16 +1388,6 @@ class App:
         r = await self.send(chat_id, text, markup, parse_mode)
         return (r or {}).get("message_id")
 
-    # ---------- доступ ----------
-
-    def is_admin(self, user_id: int) -> bool:
-        return user_id in self.cfg.get("admins", [])
-
-    def can_chat(self, user_id: int) -> bool:
-        if not self.cfg.get("admins_only"):
-            return True
-        return self.is_admin(user_id)
-
     # ---------- провайдеры ----------
 
     def next_pid(self) -> str:
@@ -1535,89 +1447,11 @@ class App:
                 return None
         return pid, provider, mid
 
-    def font_of(self, chat_id: int) -> str:
-        f = self.state.get(str(chat_id), {}).get("font") or self.cfg.get("font", DEFAULT_FONT)
-        return f if f in FONTS else DEFAULT_FONT
-
-    # ---------- фото и файлы ----------
-
-    async def download_tg_file(self, file_id: str, max_bytes: int = MAX_MEDIA_BYTES) -> Tuple[bytes, str]:
-        f = await self.api("getFile", http_timeout=30, file_id=file_id)
-        path = (f or {}).get("file_path") or ""
-        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                    "webp": "image/webp", "gif": "image/gif", "pdf": "application/pdf",
-                    "mp3": "audio/mpeg", "ogg": "audio/ogg", "mp4": "video/mp4"}
-        mime = mime_map.get(ext, "application/octet-stream")
-        url = TG_FILE_BASE.format(token=self.cfg["bot_token"], path=path)
-        assert self.session is not None
-        async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
-            if r.status >= 400:
-                raise ProviderError(f"не удалось скачать файл: HTTP {r.status}")
-            data = await r.read()
-        if len(data) > max_bytes:
-            raise ProviderError(f"файл слишком большой ({len(data) // 1024 // 1024} МБ, лимит "
-                                f"{max_bytes // 1024 // 1024} МБ)")
-        return data, mime
-
-    async def extract_media(self, msg: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str, List[str]]:
-        images: List[Dict[str, str]] = []
-        files_text = ""
-        notes: List[str] = []
-
-        async def add_image(file_id: str, mime: str) -> None:
-            try:
-                data, m = await self.download_tg_file(file_id)
-                mime = mime if mime.startswith("image/") else m
-                images.append({"type": "image", "media_type": mime or m,
-                               "data": base64.b64encode(data).decode()})
-            except (ProviderError, TgError) as e:
-                notes.append(str(e))
-            except Exception as e:  # noqa: BLE001
-                notes.append(f"не удалось скачать: {e}")
-
-        photo = msg.get("photo")
-        if photo:
-            best = max(photo, key=lambda p: p.get("width", 0) * p.get("height", 0))
-            await add_image(best.get("file_id", ""), "image/jpeg")
-
-        doc = msg.get("document")
-        if doc:
-            name = doc.get("file_name") or "file"
-            mime = (doc.get("mime_type") or "").lower()
-            ext = os.path.splitext(name)[1].lower()
-            if mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-                await add_image(doc.get("file_id", ""), mime)
-            elif mime.startswith("text/") or mime in (
-                    "application/json", "application/xml", "application/javascript",
-                    "application/x-yaml", "application/toml", "application/x-sh") or ext in TEXT_EXTS:
-                try:
-                    data, _ = await self.download_tg_file(doc.get("file_id", ""))
-                except (ProviderError, TgError) as e:
-                    notes.append(str(e))
-                else:
-                    txt = data.decode("utf-8", "replace")
-                    if txt.count("\ufffd") > len(txt) * 0.3:
-                        notes.append(f"файл «{name}» двоичный — пришлите текстом")
-                    else:
-                        cut = " …(обрезано)" if len(txt) > MAX_FILE_TEXT else ""
-                        files_text += f"📎 Файл «{name}»:\n\n{txt[:MAX_FILE_TEXT]}{cut}\n\n"
-            elif ext == ".pdf" or "pdf" in mime:
-                notes.append(f"📄 PDF «{name}» пока не поддерживается — пришлите текстом "
-                             "или скриншотом нужных страниц")
-            else:
-                notes.append(f"файл «{name}» этого типа пока не поддерживается — "
-                             "пришлите текстом или скриншотом")
-        return images, files_text, notes
-
-    # ---------- клавиатуры ----------
-
-    @staticmethod
     def kb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
         return {"inline_keyboard": [[{"text": t, "callback_data": d} for (t, d) in row] for row in rows]}
 
     def reply_kb(self, uid: int) -> Dict[str, Any]:
-        rows = KB_ADMIN_ROWS if self.is_admin(uid) else KB_USER_ROWS
+        rows = KB_ROWS
         return {
             "keyboard": [[{"text": t} for t in row] for row in rows],
             "resize_keyboard": True,
@@ -1627,18 +1461,7 @@ class App:
 
     def kb_quick(self) -> Dict[str, Any]:
         """Кнопки под ответом бота."""
-        return self.kb([[("🔄 Ещё раз", "regen"), ("🔤 Шрифт", "qfont")],
-                        [("🤖 Сменить модель", "qmodel")]])
-
-    def kb_font(self, cur: str) -> Dict[str, Any]:
-        rows: List[List[Tuple[str, str]]] = []
-        for i in range(0, len(FONT_ORDER), 2):
-            row = []
-            for f in FONT_ORDER[i:i + 2]:
-                title = ("✅ " + FONTS[f]) if f == cur else FONTS[f]
-                row.append((title, f"font:{f}"))
-            rows.append(row)
-        return self.kb(rows)
+        return self.kb([[("🔄 Ещё раз", "regen"), ("🤖 Сменить модель", "qmodel")]])
 
     def kb_providers(self, pick_prefix: str, back_data: Optional[str] = None) -> Dict[str, Any]:
         rows: List[List[Tuple[str, str]]] = []
@@ -1695,16 +1518,15 @@ class App:
 
     async def deliver(self, chat_id: int, text: str, mid: Optional[int] = None,
                       markup: bool = True) -> None:
-        """Отправить итоговый ответ в выбранном шрифте: длинные ответы режутся на части
+        """Отправить итоговый ответ: длинные ответы режутся на части
         с сохранением разметки; при ошибке разметки уходит простой текст."""
-        font = self.font_of(chat_id)
         limit = 3500
         chunks = split_text(text, limit)
         cur_mid = mid
         for i, ch in enumerate(chunks):
             last = i == len(chunks) - 1
             mk = self.kb_quick() if (last and markup) else None
-            h = render(ch, font)
+            h = render(ch)
             try:
                 if len(h) > MAX_TG:
                     raise TgError("parse: слишком длинный html")
@@ -1756,7 +1578,7 @@ class App:
         if not resolved:
             await self.send(
                 chat_id,
-                "⚠️ Модель не выбрана.\n\n/model — выбрать модель\n/add (для админа) — подключить провайдера",
+                "⚠️ Модель не выбрана.\n\n/model — выбрать модель\n/add — подключить провайдера",
                 attach_kb=True,
             )
             return
@@ -1887,16 +1709,6 @@ class App:
             if uname:
                 text = re.sub(rf"@{re.escape(uname)}", "", text, flags=re.I).strip()
 
-        # первый пользователь в личке становится владельцем
-        if not self.cfg.get("admins") and private and uid:
-            self.cfg["admins"] = [uid]
-            self.save_config()
-            self._kb_chats.discard(chat_id)
-            await self.send(chat_id, "✅ Вы назначены администратором бота.\n\n"
-                                     "Начните с /add — подключите провайдера, затем /model.\n\n" + HELP_HTML,
-                            parse_mode="HTML", attach_kb=True)
-            return
-
         if not text and not has_media:
             hints = [("voice", "🎧 Голосовые и аудио я пока не понимаю — напишите текстом или пришлите фото/файл."),
                      ("audio", "🎧 Голосовые и аудио я пока не понимаю — напишите текстом или пришлите фото/файл."),
@@ -1913,9 +1725,6 @@ class App:
         if has_media:
             if self.dialogs.get(chat_id):
                 await self.send(chat_id, "Сначала завершите мастер или отмените его (/cancel), потом пришлите файл.")
-                return
-            if not self.can_chat(uid):
-                await self.send(chat_id, "⛔ Общение с ботом ограничено администраторами.")
                 return
             images, files_text, notes = await self.extract_media(msg)
             if notes:
@@ -1947,30 +1756,13 @@ class App:
             await self.send(chat_id, f"Неизвестная команда /{cmd}. Смотрите /help", attach_kb=True)
             return
 
-        if not self.can_chat(uid):
-            await self.send(chat_id, "⛔ Общение с ботом ограничено администраторами.")
-            return
         if not text:
             return
         await self.generate_and_send(msg, text)
 
-    async def send_font_menu(self, chat_id: int) -> None:
-        cur = self.font_of(chat_id)
-        await self.send(
-            chat_id,
-            f"🔤 Шрифт ответов ИИ — сейчас: {FONTS[cur]}\n\n"
-            "Выберите из 4 шрифтов — после выбора пришлю пример.\n"
-            "ℹ️ Telegram не подгружает файлы шрифтов, поэтому каждый шрифт передаётся "
-            "родным оформлением (работает и на русском).",
-            self.kb_font(cur), attach_kb=True)
-
     async def dispatch_command(self, msg: Dict[str, Any], cmd: str, args: str) -> bool:
         chat_id = msg["chat"]["id"]
         uid = (msg.get("from") or {}).get("id", 0)
-
-        async def deny() -> bool:
-            await self.send(chat_id, "⛔ Команда только для администраторов.")
-            return True
 
         if cmd in ("start", "help"):
             self._kb_chats.discard(chat_id)  # на /start всегда обновляем клавиатуру
@@ -2006,7 +1798,6 @@ class App:
                 await self.send(
                     chat_id,
                     f"📌 Модель {src}:\n{provider['name']} → {self.model_display(pid, mid)}\n\n"
-                    f"🔤 Шрифт: {FONTS[self.font_of(chat_id)]}\n"
                     f"🌐 Веб-поиск: {'вкл' if self.cfg.get('web_tools', True) else 'выкл'}\n"
                     f"🧹 Память диалога: {len(st.get('history', [])) // 2} сообщ.",
                     attach_kb=True)
@@ -2023,8 +1814,6 @@ class App:
             return True
 
         if cmd == "web":
-            if not self.is_admin(uid):
-                return await deny()
             on = not self.cfg.get("web_tools", True)
             self.cfg["web_tools"] = on
             self.save_config()
@@ -2036,16 +1825,6 @@ class App:
             else:
                 await self.send(chat_id, "🌐 Веб-инструменты ВЫКЛЮЧЕНЫ — модель отвечает из своих знаний.",
                                 attach_kb=True)
-            return True
-
-        if cmd == "font":
-            a = args.strip().lower().replace(" ", "")
-            a = FONT_ALIASES.get(a, a)
-            if a in FONTS:
-                self.chat_state(chat_id)["font"] = a
-                self.save_state()
-                await self.send_font_sample(chat_id, a)
-            await self.send_font_menu(chat_id)
             return True
 
         if cmd == "get_id":
@@ -2066,7 +1845,7 @@ class App:
         if cmd == "providers":
             lines = ["🧩 Подключённые провайдеры:"]
             if not self.cfg["providers"]:
-                lines.append("— пока нет. Админ может добавить через /add")
+                lines.append("— пока нет. Добавьте через /add")
             for pid, p in self.cfg["providers"].items():
                 cached = self.models_cache.get(pid)
                 n = str(len(cached[1])) + " мод." if cached else "модели не загружены"
@@ -2076,11 +1855,6 @@ class App:
                     f"  {p['base_url']} · ключ: {self.mask_key(p.get('api_key', ''))} · {n}")
             await self.send(chat_id, "\n".join(lines)[:MAX_TG], attach_kb=True)
             return True
-
-        # ----- дальше только для админов -----
-        admin_cmds = ("add", "del", "default", "key", "url", "sys", "lock")
-        if cmd in admin_cmds and not self.is_admin(uid):
-            return await deny()
 
         if cmd == "add":
             await self.wizard_start(chat_id)
@@ -2145,44 +1919,51 @@ class App:
                 await self.send(chat_id, f"✅ Системный промпт сохранён:\n{args[:500]}", attach_kb=True)
             return True
 
-        if cmd == "lock":
-            self.cfg["admins_only"] = not self.cfg.get("admins_only", False)
-            self.save_config()
-            state = ("включён — писать могут только администраторы" if self.cfg["admins_only"]
-                     else "выключен — писать могут все")
-            await self.send(chat_id, f"🔒 Режим «только администраторы» {state}.", attach_kb=True)
-            return True
-
         return False
-
-    async def send_font_sample(self, chat_id: int, font: str) -> None:
-        """Пример текста в выбранном шрифте."""
-        h = render(FONT_SAMPLE, font)
-        try:
-            await self.send(chat_id, h, parse_mode="HTML")
-        except TgError:
-            await self.send(chat_id, strip_html(h))
 
     # ---------- мастер добавления провайдера ----------
 
     async def wizard_start(self, chat_id: int) -> None:
-        self.dialogs[chat_id] = {"action": "add", "step": "preset", "data": {}}
-        rows: List[List[Tuple[str, str]]] = []
-        items = list(PRESETS.items())
-        for i in range(0, len(items), 2):
-            rows.append([(p["name"], f"pre:{pid}") for pid, p in items[i:i + 2]])
+        self.dialogs[chat_id] = {"action": "add", "step": "name", "data": {}}
+        known = ", ".join(p["name"] for p in PRESETS.values())
         await self.send(
             chat_id,
-            "🧩 Подключение провайдера.\n"
-            "«🔗 Своя ссылка (авто)» — просто URL: бот сам определит тип API и загрузит список моделей. "
-            "Ключ не обязателен — подойдёт самохостинг (Ollama / LM Studio / vLLM).\n"
-            "Остальные — пресеты: выбрал → вставил только API-ключ:",
-            self.kb(rows))
+            "🧩 Подключение провайдера.\n\n"
+            "✍️ Впишите имя провайдера, например: openai, anthropic, google, deepseek, groq.\n"
+            f"Известные: {known}.\n\n"
+            "Если вашего провайдера нет в списке — впишите любое своё имя: "
+            "я спрошу ссылку на API, сам определю тип API и загружу список моделей.\n"
+            "Отмена: /cancel")
 
     async def wizard_text(self, msg: Dict[str, Any], dlg: Dict[str, Any], text: str) -> None:
         chat_id = msg["chat"]["id"]
         data = dlg["data"]
         step = dlg["step"]
+
+        if step == "name":
+            name = re.sub(r"\s+", " ", text).strip()[:40]
+            if not name:
+                await self.send(chat_id, "Впишите имя провайдера текстом (или /cancel):")
+                return
+            pid_preset = find_preset(name)
+            preset = PRESETS.get(pid_preset) if pid_preset else None
+            if preset:
+                dlg["data"] = {"name": preset["name"], "protocol": preset["protocol"],
+                               "base_url": preset["base_url"], "preset_id": pid_preset}
+                dlg["step"] = "key"
+                docs = f"\nКлюч берут здесь: {preset['docs']}" if preset.get("docs") else ""
+                await self.send(chat_id, f"✅ {preset['name']} — {preset['hint']}{docs}\n\n"
+                                         "🔑 Пришлите API-ключ (или /skip):")
+            else:
+                dlg["data"] = {"name": name, "protocol": "", "base_url": "", "auto": True,
+                               "name_given": True}
+                dlg["step"] = "url"
+                await self.send(chat_id, f"✅ Провайдер «{name}».\n\n"
+                                         "Пришлите ссылку на API (baseURL), например:\n"
+                                         "https://api.example.com/v1\n\n"
+                                         "Тип API (OpenAI / Anthropic / Gemini) я определю сам. "
+                                         "Ключ можно будет пропустить (/skip) — для Ollama, LM Studio и т. п.")
+            return
 
         if step == "url":
             url = text.strip().rstrip("/")
@@ -2193,8 +1974,9 @@ class App:
             note = ""
             if data.get("auto"):
                 data["protocol"] = detect_protocol(url)
-                m = re.match(r"https?://([^/\s]+)", url)
-                data["name"] = m.group(1) if m else "Мой провайдер"
+                if not data.get("name_given"):
+                    m = re.match(r"https?://([^/\s]+)", url)
+                    data["name"] = m.group(1) if m else "Мой провайдер"
                 note = f"🔌 Тип API определён: {PROTOCOL_TITLES.get(data['protocol'], data['protocol'])}\n"
             dlg["step"] = "key"
             await self.send(chat_id, f"{note}🔑 Теперь пришлите API-ключ (или /skip, если сервер без ключа):")
@@ -2257,41 +2039,6 @@ class App:
         msg = cq.get("message") or {}
         mid_ = msg.get("message_id", 0)
 
-        # админские действия — проверка прав (callback_data можно подделать)
-        if data.startswith(("pre:", "del:", "defpv:", "defsel", "defbk", "rm:defsel")) and not self.is_admin(uid):
-            await self.send(chat_id, "⛔ Только для администраторов.")
-            return
-        if data.startswith("sel") or data.startswith("pv:") or data in ("bk", "seldef"):
-            if not self.can_chat(uid):
-                return
-
-        # --- мастер /add ---
-        if data.startswith("pre:"):
-            preset_id = data[4:]
-            preset = PRESETS.get(preset_id)
-            if not preset:
-                return
-            dlg = self.dialogs.setdefault(chat_id, {"action": "add", "data": {}})
-            dlg["action"] = "add"
-            dlg["data"] = {"name": preset["name"], "protocol": preset["protocol"],
-                           "base_url": preset["base_url"], "preset_id": preset_id,
-                           "auto": preset_id == "custom-auto"}
-            if preset["base_url"]:
-                dlg["step"] = "key"
-                docs = f"\nКлюч: {preset['docs']}" if preset.get("docs") else ""
-                await self.edit(chat_id, mid_, f"✅ {preset['name']} — {preset['hint']}{docs}\n\n"
-                                               "🔑 Пришлите API-ключ (или /skip):")
-            else:
-                dlg["step"] = "url"
-                if preset_id == "custom-auto":
-                    txt = ("Пришлите просто ссылку на API (baseURL), например:\nhttps://api.example.com/v1\n\n"
-                           "Я сам определю тип API (OpenAI / Anthropic / Gemini), проверю ключ и загружу "
-                           "список моделей. Ключ можно пропустить (/skip) — для Ollama, LM Studio и т.п.")
-                else:
-                    txt = "Пришлите baseURL, например:\nhttps://api.example.com/v1"
-                await self.edit(chat_id, mid_, f"✅ {preset['name']}\n{txt}")
-            return
-
         # --- /model ---
         if data == "seldef":
             st = self.chat_state(chat_id)
@@ -2350,13 +2097,7 @@ class App:
             await self.send(chat_id, "🧩 Выберите провайдера:", kb)
             return
 
-        if data == "qfont":
-            await self.send_font_menu(chat_id)
-            return
-
         if data == "regen":
-            if not self.can_chat(uid):
-                return
             st = self.chat_state(chat_id)
             txt = st.get("last_user") or ""
             if not txt:
@@ -2369,18 +2110,6 @@ class App:
             fake = {"chat": {"id": chat_id, "type": "private" if chat_id > 0 else "group"},
                     "from": {"id": uid}}
             await self.generate_and_send(fake, txt)
-            return
-
-        # --- выбор шрифта (4 стиля) ---
-        if data.startswith("font:"):
-            f = data[5:]
-            if f in FONTS:
-                self.chat_state(chat_id)["font"] = f
-                self.save_state()
-                await self.edit(chat_id, mid_, f"🔤 Шрифт ответов ИИ: {FONTS[f]}\n"
-                                               "Пример ниже — следующие ответы придут в этом стиле.",
-                                self.kb_font(f))
-                await self.send_font_sample(chat_id, f)
             return
 
         # --- обновление списка моделей (🔄) ---
