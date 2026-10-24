@@ -3,33 +3,56 @@
 """
 TG AI Bot — Telegram-бот с подключаемыми AI-провайдерами (как в opencode).
 
-Быстрый старт:
+Локально (long polling, сервер не нужен):
     pip install aiohttp
-    python main.py
+    BOT_TOKEN=123:ABC python main.py      # или просто python main.py — спросит токен
 
-При первом запуске скрипт спросит токен бота (получите у @BotFather) и создаст
-config.json рядом с собой. Дальше всё настраивается прямо в Telegram:
+На Render (Web Service, всё через переменные окружения — config.json не нужен):
+    BOT_TOKEN            токен от @BotFather (обязательно)
+    ADMIN_IDS            ID админов через запятую
+    PROVIDER_1..N        провайдеры, применяются при каждом старте:
+                           PROVIDER_1=openrouter:sk-or-v1-…        (пресет:ключ)
+                           PROVIDER_2=DeepSeek|openai|https://api.deepseek.com/v1|sk-…
+                           (пресеты: openrouter openai anthropic google gemini zai
+                            groq deepseek mistral xai moonshot together fireworks cerebras)
+    DEFAULT_MODEL        модель по умолчанию, напр. deepseek-chat или openai/gpt-4o-mini
+    DEFAULT_PROVIDER     имя провайдера для дефолта (иначе первый PROVIDER_N)
+    SYSTEM_PROMPT / MAX_HISTORY / ADMIN_ONLY — применяются при каждом старте
+    Render сам задает PORT и RENDER_EXTERNAL_URL — бот поднимет HTTP-сервер
+    (health-check на "/") и зарегистрирует webhook.
+
+Дальше всё настраивается и прямо в Telegram:
     /add       — добавить провайдера (пресеты OpenRouter/OpenAI/Anthropic/...)
     /model     — выбрать модель для чата
     /providers — список провайдеров
     /help      — все команды
 
-Провайдеры хранятся в config.json, история диалогов — в state.json.
+Провайдеры хранятся в config.json, история диалогов — в state.json
+(пути можно переопределить переменными CONFIG_PATH / STATE_PATH — например,
+на постоянный диск /data при платном тарифе Render; на Render провайдеров
+можно задавать целиком через PROVIDER_1..N — тогда config.json не нужен).
+
+Режим работы (переменная MODE): "polling", "webhook" или пусто (авто —
+webhook, если задан RENDER_EXTERNAL_URL / WEBHOOK_URL, иначе polling).
 Зависимость одна: aiohttp. Python 3.9+.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
+import secrets
+import signal
 import sys
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 try:
     import aiohttp
+    from aiohttp import web
 except ImportError:
     print("Не хватает зависимости. Установите её командой:\n    pip install aiohttp")
     sys.exit(1)
@@ -39,8 +62,12 @@ except ImportError:
 # ----------------------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-STATE_PATH = os.path.join(BASE_DIR, "state.json")
+CONFIG_PATH = os.environ.get("CONFIG_PATH") or os.path.join(BASE_DIR, "config.json")
+STATE_PATH = os.environ.get("STATE_PATH") or os.path.join(BASE_DIR, "state.json")
+PORT = int(os.environ.get("PORT", "8080") or 8080)
+WEBHOOK_URL_ENV = (
+    os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_URL") or ""
+).strip().rstrip("/")
 
 TG_API = "https://api.telegram.org/bot{token}/{method}"
 
@@ -245,27 +272,176 @@ def load_json(path: str, fallback: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(fallback))  # deep copy
 
 
-def first_run_setup(cfg: Dict[str, Any]) -> None:
-    """Интерактивное первичное заполнение токена."""
-    if cfg["bot_token"]:
+def apply_env_overrides(cfg: Dict[str, Any]) -> None:
+    """Настройки из окружения — источник истины на Render.
+
+    Применяются при КАЖДОМ старте, если переменная задана (перекрывают
+    значения, изменённые в Telegram через /sys, /lock и т.д.).
+    Хотите управлять из Telegram — удалите переменную из Render.
+    """
+    applied: List[str] = []
+    ids_raw = os.environ.get("ADMIN_IDS", "").strip()
+    if ids_raw:
+        ids: List[int] = []
+        for x in re.split(r"[,;\s]+", ids_raw):
+            if x.lstrip("-").isdigit():
+                ids.append(int(x))
+        if ids:
+            cfg["admins"] = ids
+            applied.append("ADMIN_IDS")
+    sp = os.environ.get("SYSTEM_PROMPT", "").strip()
+    if sp:
+        cfg["system_prompt"] = sp
+        applied.append("SYSTEM_PROMPT")
+    mh = os.environ.get("MAX_HISTORY", "").strip()
+    if mh.isdigit():
+        cfg["max_history"] = max(2, int(mh))
+        applied.append("MAX_HISTORY")
+    ao = os.environ.get("ADMIN_ONLY", "").strip().lower()
+    if ao in ("1", "true", "yes"):
+        cfg["admins_only"] = True
+        applied.append("ADMIN_ONLY=1")
+    elif ao in ("0", "false", "no"):
+        cfg["admins_only"] = False
+        applied.append("ADMIN_ONLY=0")
+    if applied:
+        print("Из окружения применены: " + ", ".join(applied))
+
+
+def parse_provider_spec(raw: str) -> Optional[Dict[str, str]]:
+    """Разбор описания провайдера из переменной PROVIDER_N.
+
+    Поддерживаются две формы:
+      1) «пресет:ключ»       → openrouter:sk-or-… (URL и протокол из пресета)
+      2) «Имя|протокол|URL|ключ» → Свой|openai|https://api.example.com/v1|key
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+    # форма 1: пресет:ключ
+    if "|" not in raw and ":" in raw:
+        preset_id, _, key = raw.partition(":")
+        pid = preset_id.strip().lower()
+        if pid == "gemini":
+            pid = "google"
+        preset = PRESETS.get(pid)
+        if preset and preset.get("base_url"):
+            return {
+                "name": preset["name"],
+                "protocol": preset["protocol"],
+                "base_url": preset["base_url"],
+                "api_key": key.strip(),
+            }
+    # форма 2: Имя|протокол|URL|ключ
+    parts = raw.split("|")
+    if len(parts) >= 3:
+        name, proto, url = parts[0].strip(), parts[1].strip().lower(), parts[2].strip()
+        key = parts[3].strip() if len(parts) > 3 else ""
+        if proto == "google":
+            proto = "gemini"
+        if proto in PROTOCOLS and url.startswith(("http://", "https://")):
+            return {"name": name, "protocol": proto, "base_url": url.rstrip("/"), "api_key": key}
+    return None
+
+
+def parse_env_providers() -> List[Dict[str, Any]]:
+    """Собрать все непустые PROVIDER_N (N=1..64), порядок — по номеру."""
+    items: List[Tuple[int, str]] = []
+    for i in range(1, 65):
+        raw = os.environ.get(f"PROVIDER_{i}", "").strip()
+        if raw:
+            items.append((i, raw))
+    items.sort()
+    out: List[Dict[str, Any]] = []
+    for num, raw in items:
+        spec = parse_provider_spec(raw)
+        if spec:
+            spec["_idx"] = num  # id провайдера = номер переменной: PROVIDER_5 → e5
+            out.append(spec)
+        else:
+            print(f"⚠️ PROVIDER_{num}: не понял формат «{raw[:60]}…». "
+                  "Примеры: openrouter:sk-… или Имя|openai|https://…/v1|ключ")
+    return out
+
+
+def sync_env_providers(cfg: Dict[str, Any]) -> None:
+    """Провайдеры из PROVIDER_1..N — применяются при каждом старте.
+
+    id = номеру переменной (e1 = PROVIDER_1, e5 = PROVIDER_5, пропуски — ок);
+    провайдеры, добавленные через /add (p1, p2…), не затрагиваются. Чтобы
+    убрать env-провайдера — уберите его переменную из Render (удаление
+    через /del переживёт только до рестарта).
+    """
+    specs = parse_env_providers()
+    if not specs:
         return
+    providers = cfg["providers"]
+    for k in [k for k in providers if k.startswith("e")]:
+        del providers[k]
+    names: List[str] = []
+    for spec in specs:
+        pid = f"e{spec['_idx']}"
+        name, base = spec["name"], spec["name"]
+        n = 2
+        while any(p["name"] == name for k, p in providers.items() if k != pid):
+            name = f"{base} {n}"
+            n += 1
+        providers[pid] = {
+            "name": name,
+            "protocol": spec["protocol"],
+            "base_url": spec["base_url"],
+            "api_key": spec["api_key"],
+            "enabled": True,
+        }
+        names.append(f"{pid}={name}")
+
+    # модель по умолчанию из окружения (DEFAULT_MODEL / DEFAULT_PROVIDER)
+    dm = os.environ.get("DEFAULT_MODEL", "").strip()
+    if dm:
+        dp = os.environ.get("DEFAULT_PROVIDER", "").strip()
+        match = None
+        for pid, p in providers.items():
+            if pid == dp or p["name"].lower() == dp.lower():
+                match = pid
+                break
+        if not match:
+            match = "e1" if "e1" in providers else next(iter(providers), "")
+        if match:
+            cfg["default"] = {"provider": match, "model": dm}
+            names.append(f"по умолчанию: {dm}")
+
+    _atomic_write(CONFIG_PATH, cfg)
+    print("Провайдеры из окружения: " + ", ".join(names))
+
+
+def first_run_setup(cfg: Dict[str, Any]) -> None:
+    """Токен: приоритет у окружения BOT_TOKEN, иначе интерактивно."""
     env = os.environ.get("BOT_TOKEN", "").strip()
     if env:
-        cfg["bot_token"] = env
-        print("Токен взят из переменной окружения BOT_TOKEN")
-    else:
-        print("=" * 60)
-        print("Первый запуск. Создайте бота у @BotFather и вставьте его токен.")
-        print("(токен будет сохранён в config.json рядом со скриптом)")
-        print("=" * 60)
-        try:
-            token = input("Токен (123456789:ABC-DEF…): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nОтмена. Можно вписать токен в config.json вручную.")
-            sys.exit(1)
-        if not re.fullmatch(r"\d+:[\w-]+", token):
-            print("Токен выглядит странно, но сохраню как есть — если что, поправьте config.json")
-        cfg["bot_token"] = token
+        if cfg.get("bot_token") != env:
+            first = not cfg.get("bot_token")
+            cfg["bot_token"] = env
+            _atomic_write(CONFIG_PATH, cfg)
+            print("Токен обновлён из переменной окружения BOT_TOKEN" if not first
+                  else "Токен взят из переменной окружения BOT_TOKEN")
+        return
+    if cfg["bot_token"]:
+        return
+    if not (sys.stdin and sys.stdin.isatty()):
+        sys.exit("❌ BOT_TOKEN не задан. Укажите переменную окружения BOT_TOKEN "
+                 "(токен от @BotFather) или вписать его в config.json.")
+    print("=" * 60)
+    print("Первый запуск. Создайте бота у @BotFather и вставьте его токен.")
+    print("(токен будет сохранён в config.json рядом со скриптом)")
+    print("=" * 60)
+    try:
+        token = input("Токен (123456789:ABC-DEF…): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nОтмена. Можно вписать токен в config.json вручную.")
+        sys.exit(1)
+    if not re.fullmatch(r"\d+:[\w-]+", token):
+        print("Токен выглядит странно, но сохраню как есть — если что, поправьте config.json")
+    cfg["bot_token"] = token
     _atomic_write(CONFIG_PATH, cfg)
 
 
@@ -1204,6 +1380,90 @@ class App:
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ Ошибка обработки апдейта: {e}")
 
+    # ---------- webhook-режим (Render и другие хостинги) ----------
+
+    async def run_webhook(self, base_url: str, port: int) -> None:
+        """Webhook-режим: HTTP-сервер принимает апдейты от Telegram.
+
+        Нужен на хостингах типа Render (Web Service обязан слушать PORT и
+        отвечать на health-check). Входящие сообщения бота — это HTTP-трафик,
+        который поддерживает сервис активным и будит его после сна.
+        """
+        if not base_url.startswith(("http://", "https://")):
+            sys.exit("❌ WEBHOOK_URL / RENDER_EXTERNAL_URL должен начинаться с http(s)://")
+        timeout = aiohttp.ClientTimeout(total=None)
+        hook_path = "hook-" + hashlib.sha256(self.cfg["bot_token"].encode()).hexdigest()[:16]
+        secret = secrets.token_hex(24)
+        me: Dict[str, Any] = {}
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            self.session = session
+            try:
+                me = await self.api("getMe")
+            except TgError as e:
+                sys.exit(f"❌ Telegram отклонил токен: {e}")
+
+            async def telegram_update(request: web.Request) -> web.Response:
+                if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+                    return web.Response(status=403, text="forbidden")
+                try:
+                    up = await request.json()
+                except Exception:
+                    return web.Response(status=400, text="bad json")
+                asyncio.create_task(self.handle_update(up))
+                return web.Response(text="ok")
+
+            async def health(request: web.Request) -> web.Response:
+                return web.Response(
+                    text=f"🤖 Бот работает: @{me.get('username', '?')}",
+                    content_type="text/plain", charset="utf-8",
+                )
+
+            webapp = web.Application()
+            webapp.router.add_get("/", health)
+            webapp.router.add_get("/healthz", health)
+            webapp.router.add_post("/" + hook_path, telegram_update)
+
+            runner = web.AppRunner(webapp, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+
+            try:
+                await self.api(
+                    "set_webhook",
+                    http_timeout=30,
+                    url=f"{base_url}/{hook_path}",
+                    secret_token=secret,
+                    allowed_updates=["message", "callback_query"],
+                    max_connections=40,
+                    drop_pending_updates=False,
+                )
+            except TgError as e:
+                await runner.cleanup()
+                sys.exit(f"❌ Не удалось зарегистрировать webhook: {e}")
+
+            print("=" * 60)
+            print(f"✅ Бот @{me.get('username', '?')} запущен (webhook): https://t.me/{me.get('username', '?')}")
+            print(f"   Webhook: {base_url}/{hook_path}")
+            print(f"   Слушаю 0.0.0.0:{port} · Конфиг: {CONFIG_PATH}")
+            if not self.cfg["providers"]:
+                print("   Провайдеров пока нет — отправьте боту /add")
+            print("=" * 60)
+
+            stop = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(sig, stop.set)
+                except NotImplementedError:
+                    pass
+            await stop.wait()
+
+            # webhook НЕ удаляем: Telegram подержит апдейты, пока сервис рестартует
+            print("⏹ Останавливаюсь…")
+            await runner.cleanup()
+
     # ---------- главный цикл ----------
 
     async def run(self) -> None:
@@ -1261,15 +1521,33 @@ class App:
 
 
 def main() -> None:
+    # пути для данных могут быть переопределены (например, диск /data на Render)
+    for p in (CONFIG_PATH, STATE_PATH):
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+
     cfg = load_json(CONFIG_PATH, default_config())
+    apply_env_overrides(cfg)
+    sync_env_providers(cfg)
     first_run_setup(cfg)
+
+    mode = os.environ.get("MODE", "").strip().lower()
+    use_webhook = (mode == "webhook") or (mode != "polling" and bool(WEBHOOK_URL_ENV))
+
     app = App(cfg)
     try:
-        asyncio.run(app.run())
+        if use_webhook:
+            if not WEBHOOK_URL_ENV:
+                sys.exit("❌ Режим webhook включён, но не задан RENDER_EXTERNAL_URL или WEBHOOK_URL")
+            print(f"🌐 Режим: webhook ({WEBHOOK_URL_ENV})")
+            asyncio.run(app.run_webhook(WEBHOOK_URL_ENV, PORT))
+        else:
+            print("🔌 Режим: long polling")
+            asyncio.run(app.run())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен.")
 
 
 if __name__ == "__main__":
     main()
- 
