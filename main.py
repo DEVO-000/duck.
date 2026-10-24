@@ -129,6 +129,14 @@ FONTS = {
     "plain": "📄 Простой текст",
 }
 FONT_ORDER = ["rich", "mono", "bold", "italic", "plain"]
+# алиасы для /font по-русски: /font моно = /font mono
+FONT_ALIASES = {
+    "обычный": "rich", "маркдаун": "rich", "markdown": "rich",
+    "моно": "mono", "моноширинный": "mono", "код": "mono",
+    "жирный": "bold",
+    "курсив": "italic",
+    "простой": "plain", "текст": "plain",
+}
 
 # --- reply-клавиатура: все команды кнопками, по разделам ---
 MENU_BTN = {
@@ -338,6 +346,7 @@ HELP_TEXT = "\n".join([
     "📷 Можно присылать фото (модель их увидит) и файлы: код, txt, csv, json…",
     "🌐 Умею искать в интернете и открывать ссылки, если нужны свежие данные.",
     "⌨️ Все команды продублированы кнопками под полем ввода, по разделам.",
+    "🎧 Голосовые/видео пока не понимаю; фото (vision), файлы и текст — да.",
     "",
     "— Чат и модель —",
     "/model — выбрать модель для этого чата",
@@ -358,7 +367,7 @@ HELP_TEXT = "\n".join([
     "/web — вкл/выкл веб-инструменты (поиск и чтение страниц)",
     "",
     "— Настройки (админ) —",
-    "/sys <текст> — системный промпт (/sys off — выключить)",
+    "/sys — показать системный промпт (/sys <текст> — задать, /sys off — выключить)",
     "/lock — переключить режим «только администраторы»",
     "",
     "— Прочее —",
@@ -670,7 +679,7 @@ def first_run_setup(cfg: Dict[str, Any]) -> None:
         return
     if not (sys.stdin and sys.stdin.isatty()):
         sys.exit("❌ BOT_TOKEN не задан. Укажите переменную окружения BOT_TOKEN "
-                 "(токен от @BotFather) или вписать его в config.json.")
+                 "(токен от @BotFather) или впишите его в config.json.")
     print("=" * 60)
     print("Первый запуск. Создайте бота у @BotFather и вставьте его токен.")
     print("(токен будет сохранён в config.json рядом со скриптом)")
@@ -723,7 +732,8 @@ async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any
     key = provider.get("api_key", "")
 
     if proto == "gemini":
-        url = f"{base}/v1beta/models?pageSize=200"
+        vb = "" if re.search(r"/v\d\w*$", base) else "/v1beta"  # без задвоения /v1beta
+        url = f"{base}{vb}/models?pageSize=200"
         if key:
             url += f"&key={key}"
         async with session.get(url) as r:
@@ -743,7 +753,8 @@ async def fetch_models(session: "aiohttp.ClientSession", provider: Dict[str, Any
         headers = {"anthropic-version": "2023-06-01"}
         if key:
             headers["x-api-key"] = key
-        async with session.get(f"{base}/v1/models?limit=1000", headers=headers) as r:
+        v1 = "" if re.search(r"/v\d$", base) else "/v1"  # без задвоения /v1
+        async with session.get(f"{base}{v1}/models?limit=1000", headers=headers) as r:
             data = await _json_or_error(r)
         out = []
         for m in data.get("data", []):
@@ -879,11 +890,14 @@ async def stream_chat(
                 msgs.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]})
             else:
                 msgs.append({"role": m["role"], "content": _openai_content(m["content"])})
+        if system:
+            msgs.insert(0, {"role": "system", "content": system})
         payload: Dict[str, Any] = {"model": model, "messages": msgs, "stream": True}
         if tools:
             payload["tools"] = _tools_for(proto)
     elif proto == "anthropic":
-        url = f"{base}/v1/messages"
+        v1 = "" if re.search(r"/v\d$", base) else "/v1"  # без задвоения /v1
+        url = f"{base}{v1}/messages"
         headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
         if key:
             headers["x-api-key"] = key
@@ -915,10 +929,13 @@ async def stream_chat(
         flush_tools()
         payload = {"model": model, "max_tokens": MAX_TOKENS_ANTHROPIC,
                    "messages": a_msgs, "stream": True}
+        if system:
+            payload["system"] = system
         if tools:
             payload["tools"] = _tools_for(proto)
     elif proto == "gemini":
-        url = f"{base}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        vb = "" if re.search(r"/v\d\w*$", base) else "/v1beta"  # без задвоения /v1beta
+        url = f"{base}{vb}/models/{model}:streamGenerateContent?alt=sse"
         if key:
             url += f"&key={key}"
         headers = {"Content-Type": "application/json"}
@@ -976,6 +993,47 @@ async def stream_chat(
             if resp.status >= 400:
                 text = (await resp.text())[:400].replace("\n", " ")
                 raise ProviderError(f"HTTP {resp.status}: {text}")
+
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            if "event-stream" not in ct:
+                # некоторые серверы/прокси игнорируют stream:true и отвечают обычным JSON
+                try:
+                    obj = await resp.json(content_type=None)
+                except Exception:
+                    raise ProviderError(f"HTTP {resp.status}: ответ не JSON и не поток")
+                body = ""
+                calls_out: List[Dict[str, str]] = []
+                if proto == "openai":
+                    ch = (obj.get("choices") or [{}])[0]
+                    mm = ch.get("message") or {}
+                    body = mm.get("content") or ""
+                    for i, tc in enumerate(mm.get("tool_calls") or []):
+                        fn = tc.get("function") or {}
+                        calls_out.append({"id": tc.get("id") or f"call{i}",
+                                          "name": fn.get("name", ""),
+                                          "args": fn.get("arguments") or "{}"})
+                elif proto == "anthropic":
+                    for b in obj.get("content") or []:
+                        if b.get("type") == "text":
+                            body += b.get("text", "")
+                        elif b.get("type") == "tool_use":
+                            calls_out.append({"id": b.get("id", ""), "name": b.get("name", ""),
+                                              "args": json.dumps(b.get("input") or {}, ensure_ascii=False)})
+                else:  # gemini
+                    for cand in obj.get("candidates") or []:
+                        for part in ((cand.get("content") or {}).get("parts") or []):
+                            if part.get("text"):
+                                body += part["text"]
+                            if part.get("functionCall"):
+                                fc = part["functionCall"]
+                                calls_out.append({"id": f"call{len(calls_out)}",
+                                                  "name": fc.get("name", ""),
+                                                  "args": json.dumps(fc.get("args") or {}, ensure_ascii=False)})
+                if body:
+                    yield ("text", body)
+                if calls_out:
+                    yield ("tools", calls_out)
+                return
 
             async for line in _sse_data_lines(resp):
                 if line == "[DONE]":
@@ -1049,16 +1107,31 @@ def _clean_html(s: str) -> str:
 
 
 async def web_search(session: "aiohttp.ClientSession", query: str, limit: int = 6) -> str:
+    page = ""
+    # POST надёжнее GET против анти-бота DuckDuckGo (как в референсе)
     try:
-        async with session.get("https://html.duckduckgo.com/html/",
-                               params={"q": query, "kl": "ru-ru"},
-                               headers=UA,
-                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-            page = await r.text(errors="ignore")
-    except Exception as e:  # noqa: BLE001
-        return f"Ошибка поиска: {e}"
+        async with session.post("https://html.duckduckgo.com/html/",
+                                data={"q": query, "kl": "ru-ru"},
+                                headers=UA,
+                                timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status < 400:
+                page = await r.text(errors="ignore")
+    except Exception:  # noqa: BLE001
+        pass
     links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+    if not links:
+        # фолбэк на lite-зеркало (обычно доступнее с датацентровых IP)
+        try:
+            async with session.get("https://lite.duckduckgo.com/lite/",
+                                   params={"q": query},
+                                   headers=UA,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as r:
+                page = await r.text(errors="ignore")
+        except Exception as e:  # noqa: BLE001
+            return f"Ошибка поиска: {e}"
+        links = re.findall(r'class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+        snippets = re.findall(r"class=\"result-snippet\"[^>]*>(.*?)</td>", page, re.S)
     out = []
     for i, (href, title) in enumerate(links[:limit]):
         m = re.search(r"uddg=([^&]+)", href)
@@ -1104,15 +1177,21 @@ def _is_tools_error(err: str) -> bool:
 # --- оформление ответов ---
 
 def md_to_html(text: str) -> str:
-    """Markdown → Telegram HTML: **жирный**, *курсив*, `код`, ```блоки```, # заголовки."""
+    """Markdown → Telegram HTML: **жирный**, __жирный__, *курсив*, ~~зачёркнутый~~,
+    `код`, ```блоки```, # заголовки, [ссылки](url)."""
     text = html.escape(text, quote=False)
     text = re.sub(r"```(\w*)\n?(.*?)```",
                   lambda m: f'<pre><code class="language-{m.group(1)}">{m.group(2)}</code></pre>'
                   if m.group(1) else f"<pre><code>{m.group(2)}</code></pre>",
                   text, flags=re.DOTALL)
     text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    # [текст](https://…) → <a> (до жирного/курсива, чтобы не съесть ** внутри)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"(?<![\w_])__(.+?)__(?!\w)", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
-    text = re.sub(r"(?<![\w*])\*([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    # одиночные * — курсив, но не «5 * 3 * 2» (после открывающей * не пробел)
+    text = re.sub(r"(?<![\w*])\*(?!\s)([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", text)
     text = re.sub(r"^#{1,4}\s+(.*)$", r"<b>\1</b>", text, flags=re.MULTILINE)
     return text
 
@@ -1192,6 +1271,15 @@ class App:
         # чаты, которым уже отправлена reply-клавиатура (не спамим повторами)
         self._kb_chats: set = set()
         self._save_lock = asyncio.Lock()
+        # сильные ссылки на фоновые задачи (иначе GC может убить апдейт на лету)
+        self._tasks: set = set()
+
+    def spawn(self, coro: Any) -> None:
+        """Фоновая задача с сильной ссылкой — без неё Python может собрать
+        задачу сборщиком мусора прямо во время обработки сообщения."""
+        t = asyncio.create_task(coro)
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
 
     # ---------- persistence ----------
 
@@ -1218,8 +1306,8 @@ class App:
             raise TgError("таймаут запроса к Telegram")
         except aiohttp.ClientError as e:
             raise TgError(f"сеть: {e}")
-        if not data.get("ok"):
-            raise TgError(str(data.get("description", "unknown error")))
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise TgError(str((data or {}).get("description", f"HTTP {r.status}: unknown error")))
         return data.get("result")
 
     async def api_with_retry(self, method: str, attempts: int = 3, delay: float = 4.0,
@@ -1249,14 +1337,19 @@ class App:
             "text": text[:MAX_TG],
             "disable_web_page_preview": True,
         }
+        mark_kb = False
         if reply_markup:
             kwargs["reply_markup"] = reply_markup
         elif attach_kb and chat_id > 0 and chat_id not in self._kb_chats:
-            self._kb_chats.add(chat_id)
             kwargs["reply_markup"] = self.reply_kb(chat_id)  # в личке chat_id == uid
+            mark_kb = True
         if parse_mode:
             kwargs["parse_mode"] = parse_mode
-        return await self.api("sendMessage", **kwargs)
+        res = await self.api("sendMessage", **kwargs)
+        # клавиатура считается отправленной только после успешной доставки
+        if mark_kb:
+            self._kb_chats.add(chat_id)
+        return res
 
     async def edit(self, chat_id: int, message_id: int, text: str, reply_markup: Optional[Dict] = None,
                    parse_mode: Optional[str] = None) -> None:
@@ -1416,6 +1509,9 @@ class App:
                     else:
                         cut = " …(обрезано)" if len(txt) > MAX_FILE_TEXT else ""
                         files_text += f"📎 Файл «{name}»:\n\n{txt[:MAX_FILE_TEXT]}{cut}\n\n"
+            elif ext == ".pdf" or "pdf" in mime:
+                notes.append(f"📄 PDF «{name}» пока не поддерживается — пришлите его текстом "
+                             "или скриншотом нужных страниц")
             else:
                 notes.append(f"файл «{name}» этого типа пока не поддерживается — "
                              "пришлите текстом или скриншотом")
@@ -1521,7 +1617,8 @@ class App:
 
     async def send_final(self, chat_id: int, msg_id: int, text: str) -> None:
         """Финальный ответ: оформление по шрифту чата (+ кнопка смены модели).
-        Длинные ответы разбиваются (без форматирования)."""
+        Длинные ответы разбиваются (без форматирования). Если сообщение-плейсхолдер
+        уже удалено пользователем — ответ уходит новым сообщением."""
         quick = self.kb([[("🤖 Сменить модель", "qmodel")]])
         st = self.chat_state(chat_id)
         font = st.get("font") or self.cfg.get("font", "rich")
@@ -1534,23 +1631,31 @@ class App:
             html_text = "<i>" + md_to_html(text) + "</i>"
         elif font == "rich":
             html_text = md_to_html(text)
-        if html_text is not None and len(html_text) <= MAX_TG:
+        try:
+            if html_text is not None and len(html_text) <= MAX_TG:
+                try:
+                    await self.edit(chat_id, msg_id, html_text, quick, parse_mode="HTML")
+                    return
+                except TgError:
+                    pass  # не разобралась разметка → обычный текст ниже
+            if len(text) <= MAX_TG:
+                await self.edit(chat_id, msg_id, text, quick)
+            else:
+                chunks = []
+                rest = text
+                while rest:
+                    chunks.append(rest[:MAX_TG])
+                    rest = rest[MAX_TG:]
+                await self.edit(chat_id, msg_id, chunks[0], quick)
+                for c in chunks[1:]:
+                    await self.send(chat_id, c)
+        except TgError:
+            # плейсхолдер удалён («message to edit not found») или старше 48 ч —
+            # не пугаем пользователя ошибкой, а просто отправляем ответ заново
             try:
-                await self.edit(chat_id, msg_id, html_text, quick, parse_mode="HTML")
-                return
+                await self.send(chat_id, text[:MAX_TG], quick)
             except TgError:
-                pass  # не разобралась разметка → обычный текст ниже
-        if len(text) <= MAX_TG:
-            await self.edit(chat_id, msg_id, text, quick)
-        else:
-            chunks = []
-            rest = text
-            while rest:
-                chunks.append(rest[:MAX_TG])
-                rest = rest[MAX_TG:]
-            await self.edit(chat_id, msg_id, chunks[0], quick)
-            for c in chunks[1:]:
-                await self.send(chat_id, c)
+                pass
 
     async def generate_and_send(self, msg: Dict[str, Any], user_text: str,
                                 images: Optional[List[Dict[str, str]]] = None,
@@ -1573,7 +1678,8 @@ class App:
         history: List[Dict[str, Any]] = st.get("history", [])
         max_hist = int(self.cfg.get("max_history", 24) or 24)
 
-        tools_on = bool(self.cfg.get("web_tools", True)) and pid not in self._no_tools
+        tools_on = bool(self.cfg.get("web_tools", True)) and \
+            f"{pid}|{model_id}" not in self._no_tools  # не умеет tools — только эта модель
 
         def build_messages(with_tools: bool) -> List[Dict[str, Any]]:
             sp = self.cfg.get("system_prompt", "")
@@ -1590,8 +1696,6 @@ class App:
             return [{"role": "system", "content": sp}] + history + \
                 [{"role": "user", "content": user_content}]
 
-        messages = build_messages(tools_on)
-
         placeholder = await self.send(chat_id, f"⌛ {provider['name']} · {display}\nДумаю\n0с")
         msg_id = placeholder["message_id"]
         timer = ThinkingTimer(self, chat_id, msg_id, provider["name"])
@@ -1601,29 +1705,36 @@ class App:
         full = ""
         try:
             timer.run()
+            last_edit = 0.0
+
+            async def consume(use_tools: bool) -> Tuple[str, List[Dict[str, str]]]:
+                """Один раунд стрима: текст + возможные вызовы инструментов."""
+                nonlocal last_edit
+                acc, calls = "", []
+                async for kind, piece in stream_chat(self.session, provider, model_id,
+                                                     conv, tools=use_tools):  # type: ignore[arg-type]
+                    if kind == "tools":
+                        calls = piece
+                        continue
+                    acc += piece
+                    if timer.active:
+                        await timer.stop()
+                    now = time.monotonic()
+                    if now - last_edit >= EDIT_EVERY:
+                        last_edit = now
+                        try:
+                            await self.edit(chat_id, msg_id, acc[-MAX_TG:] + " ▌")
+                        except TgError:
+                            pass
+                return acc, calls
+
             for attempt in (0, 1):
-                conv = list(messages)
+                conv = build_messages(tools_on)  # при retry пересобираем уже без поисковой инструкции
                 full = ""
-                last_edit = 0.0
                 rounds = MAX_TOOL_ROUNDS if tools_on else 1
                 try:
                     for _round in range(rounds):
-                        acc = ""
-                        calls: List[Dict[str, str]] = []
-                        async for kind, piece in stream_chat(self.session, provider, model_id, conv, tools=tools_on):  # type: ignore[arg-type]
-                            if kind == "tools":
-                                calls = piece
-                                continue
-                            acc += piece
-                            if timer.active:
-                                await timer.stop()
-                            now = time.monotonic()
-                            if now - last_edit >= EDIT_EVERY:
-                                last_edit = now
-                                try:
-                                    await self.edit(chat_id, msg_id, acc[-MAX_TG:] + " ▌")
-                                except TgError:
-                                    pass
+                        acc, calls = await consume(tools_on)
                         if not calls:
                             full = acc
                             break
@@ -1637,11 +1748,15 @@ class App:
                                          "name": c["name"], "content": result})
                         timer.set_label("Думаю")
                         full = acc
+                    else:
+                        # все раунды ушли на инструменты — просим финальный ответ без них
+                        acc, _ = await consume(False)
+                        full = acc or full
                     break
                 except ProviderError as e:
                     if attempt == 0 and tools_on and _is_tools_error(str(e)):
                         # провайдер не умеет инструменты — запоминаем и повторяем без них
-                        self._no_tools.add(pid)
+                        self._no_tools.add(f"{pid}|{model_id}")
                         tools_on = False
                         try:
                             await self.edit(
@@ -1679,6 +1794,20 @@ class App:
                 await self.send(chat_id, err[:MAX_TG])
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            err = ("⏱ Провайдер отвечал слишком долго и соединение оборвалось.\n"
+                   "Попробуйте ещё раз или выберите другую модель: /model")
+            try:
+                await self.edit(chat_id, msg_id, err)
+            except TgError:
+                await self.send(chat_id, err)
+        except aiohttp.ClientError as e:
+            err = (f"🔌 Соединение с провайдером оборвалось: {e}\n"
+                   "Обычно помогает повторить запрос через минуту.")
+            try:
+                await self.edit(chat_id, msg_id, err[:MAX_TG])
+            except TgError:
+                await self.send(chat_id, err[:MAX_TG])
         except Exception as e:  # noqa: BLE001
             err = f"⚠️ Непредвиденная ошибка:\n{e}"
             try:
@@ -1718,6 +1847,18 @@ class App:
             return
 
         if not text and not has_media:
+            if msg.get("voice") or msg.get("audio"):
+                await self.send(chat_id, "🎧 Голосовые сообщения и аудио я пока не понимаю — "
+                                         "напишите текстом или пришлите фото/файл.", attach_kb=True)
+                return
+            if msg.get("video") or msg.get("video_note"):
+                await self.send(chat_id, "🎬 Видео я пока не понимаю — пришлите скриншот "
+                                         "или опишите вопрос текстом.", attach_kb=True)
+                return
+            if msg.get("sticker"):
+                await self.send(chat_id, "🙂 Стикеры не понимаю — напишите текстом, "
+                                         "пришлите фото или файл.", attach_kb=True)
+                return
             await self.send(chat_id, "Пока я понимаю текст, фото и файлы 🙏", attach_kb=True)
             return
 
@@ -1802,9 +1943,13 @@ class App:
             if r:
                 pid, provider, mid = r
                 src = "выбрана в этом чате" if (st.get("model") or st.get("provider")) else "по умолчанию"
+                font = st.get("font") or self.cfg.get("font", "rich")
                 await self.send(
                     chat_id,
-                    f"📌 Модель {src}:\n{provider['name']} → {self.model_display(pid, mid)}",
+                    f"📌 Модель {src}:\n{provider['name']} → {self.model_display(pid, mid)}\n\n"
+                    f"🔤 Шрифт: {FONTS.get(font, font)}\n"
+                    f"🌐 Веб-поиск: {'вкл' if self.cfg.get('web_tools', True) else 'выкл'}\n"
+                    f"🧹 Память диалога: {len(st.get('history', [])) // 2} сообщ.",
                     attach_kb=True,
                 )
             else:
@@ -1826,6 +1971,7 @@ class App:
             self.cfg["web_tools"] = on
             self.save_config()
             if on:
+                self._no_tools.clear()  # возможно, модели уже научились — попробуем снова
                 await self.send(chat_id,
                                 "🌐 Веб-инструменты ВКЛЮЧЕНЫ: модель может искать в интернете "
                                 "(web_search) и открывать страницы (read_url). "
@@ -1841,6 +1987,7 @@ class App:
             st = self.chat_state(chat_id)
             cur = st.get("font") or self.cfg.get("font", "rich")
             a = args.strip().lower()
+            a = FONT_ALIASES.get(a, a)  # /font моно = /font mono
             if a in FONTS:
                 st["font"] = a
                 self.save_state()
@@ -1873,7 +2020,7 @@ class App:
         if cmd == "providers":
             lines = ["🧩 Подключённые провайдеры:"]
             if not self.cfg["providers"]:
-                lines.append("— пока none. Админ может добавить через /add")
+                lines.append("— пока нет. Админ может добавить через /add")
             for pid, p in self.cfg["providers"].items():
                 cached = self.models_cache.get(pid)
                 n = str(len(cached[1])) + " мод." if cached else "модели не загружены"
@@ -1951,7 +2098,19 @@ class App:
             if not self.is_admin(uid):
                 await self.send(chat_id, "⛔ Команда только для администраторов.")
                 return True
-            if not args or args.lower() in ("off", "выкл"):
+            if not args:
+                # без аргументов — показать текущий промпт (раньше он здесь случайно стирался)
+                cur = self.cfg.get("system_prompt", "")
+                if cur:
+                    await self.send(chat_id,
+                                    f"💬 Текущий системный промпт:\n\n{cur[:1500]}\n\n"
+                                    "Изменить: /sys <текст> · Выключить: /sys off",
+                                    attach_kb=True)
+                else:
+                    await self.send(chat_id, "💬 Системный промпт выключен.\n\nЗадать: /sys <текст>",
+                                    attach_kb=True)
+                return True
+            if args.lower() in ("off", "выкл", "выключить"):
                 self.cfg["system_prompt"] = ""
                 self.save_config()
                 await self.send(chat_id, "Системный промпт выключен.", attach_kb=True)
@@ -2080,6 +2239,18 @@ class App:
         if data == "noop":
             return
 
+        try:
+            await self.handle_callback(cq, chat_id, uid, data)
+        except TgError as e:
+            # кнопка на старом (>48 ч) или удалённом сообщении — не молчим, а объясняем
+            try:
+                await self.send(chat_id,
+                                f"⚠️ Кнопка не сработала: {e}\n\nОткройте меню заново: /model или /help")
+            except TgError:
+                pass
+
+    async def handle_callback(self, cq: Dict[str, Any], chat_id: int,
+                              uid: int, data: str) -> None:
         msg = cq.get("message") or {}
 
         # --- мастер /add ---
@@ -2344,7 +2515,7 @@ class App:
                     up = await request.json()
                 except Exception:
                     return web.Response(status=400, text="bad json")
-                asyncio.create_task(self.handle_update(up))
+                self.spawn(self.handle_update(up))
                 return web.Response(text="ok")
 
             async def health(request: web.Request) -> web.Response:
@@ -2438,7 +2609,7 @@ class App:
                     )
                     for up in updates or []:
                         offset = up["update_id"] + 1
-                        asyncio.create_task(self.handle_update(up))
+                        self.spawn(self.handle_update(up))
                 except TgError as e:
                     desc = str(e)
                     if "409" in desc or "webhook" in desc.lower():
