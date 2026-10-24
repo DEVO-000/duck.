@@ -15,6 +15,9 @@ TG AI Bot — Telegram-бот с подключаемыми AI-провайде�
                            PROVIDER_2=DeepSeek|openai|https://api.deepseek.com/v1|sk-…
                            (пресеты: openrouter openai anthropic google gemini zai
                             groq deepseek mistral xai moonshot together fireworks cerebras)
+    CUSTOM_URL / CUSTOM_KEY / CUSTOM_NAME / CUSTOM_PROTOCOL / CUSTOM_MODEL
+                         свой провайдер с произвольным URL — без пресетов,
+                         ни от кого не зависит (id: ec)
     DEFAULT_MODEL        модель по умолчанию, напр. deepseek-chat или openai/gpt-4o-mini
     DEFAULT_PROVIDER     имя провайдера для дефолта (иначе первый PROVIDER_N)
     SYSTEM_PROMPT / MAX_HISTORY / ADMIN_ONLY — применяются при каждом старте
@@ -85,6 +88,27 @@ PROTOCOL_TITLES = {
 }
 
 PRESETS: Dict[str, Dict[str, str]] = {
+    "custom-openai": {
+        "name": "Свой сервер (OpenAI-compatible)",
+        "protocol": "openai",
+        "base_url": "",
+        "docs": "",
+        "hint": "Любой ваш URL: vLLM, LM Studio, прокси…",
+    },
+    "custom-anthropic": {
+        "name": "Свой сервер (Anthropic-compatible)",
+        "protocol": "anthropic",
+        "base_url": "",
+        "docs": "",
+        "hint": "Любой клон Claude API",
+    },
+    "custom-gemini": {
+        "name": "Свой сервер (Gemini-compatible)",
+        "protocol": "gemini",
+        "base_url": "",
+        "docs": "",
+        "hint": "Любой прокси Gemini API",
+    },
     "openrouter": {
         "name": "OpenRouter",
         "protocol": "openai",
@@ -175,27 +199,6 @@ PRESETS: Dict[str, Dict[str, str]] = {
         "base_url": "https://api.cerebras.ai/v1",
         "docs": "https://cloud.cerebras.ai",
         "hint": "Сверхбыстрый инференс",
-    },
-    "custom-openai": {
-        "name": "Свой OpenAI-compatible",
-        "protocol": "openai",
-        "base_url": "",
-        "docs": "",
-        "hint": "vLLM, LM Studio, прокси…",
-    },
-    "custom-anthropic": {
-        "name": "Свой Anthropic-compatible",
-        "protocol": "anthropic",
-        "base_url": "",
-        "docs": "",
-        "hint": "Клоны Claude API",
-    },
-    "custom-gemini": {
-        "name": "Свой Gemini-compatible",
-        "protocol": "gemini",
-        "base_url": "",
-        "docs": "",
-        "hint": "Прокси Gemini API",
     },
 }
 
@@ -365,15 +368,17 @@ def parse_env_providers() -> List[Dict[str, Any]]:
 
 
 def sync_env_providers(cfg: Dict[str, Any]) -> None:
-    """Провайдеры из PROVIDER_1..N — применяются при каждом старте.
+    """Провайдеры из PROVIDER_1..N и CUSTOM_* — применяются при каждом старте.
 
     id = номеру переменной (e1 = PROVIDER_1, e5 = PROVIDER_5, пропуски — ок);
+    свой провайдер с произвольным URL — CUSTOM_URL/CUSTOM_KEY/… (id ec);
     провайдеры, добавленные через /add (p1, p2…), не затрагиваются. Чтобы
     убрать env-провайдера — уберите его переменную из Render (удаление
     через /del переживёт только до рестарта).
     """
     specs = parse_env_providers()
-    if not specs:
+    c_url = clean_secret(os.environ.get("CUSTOM_URL", "")).rstrip("/")
+    if not specs and not c_url:
         return
     providers = cfg["providers"]
     for k in [k for k in providers if k.startswith("e")]:
@@ -394,6 +399,36 @@ def sync_env_providers(cfg: Dict[str, Any]) -> None:
             "enabled": True,
         }
         names.append(f"{pid}={name}")
+
+    # --- свой провайдер с произвольным URL (CUSTOM_*), id "ec" — ни от кого не зависит
+    if c_url:
+        if not c_url.startswith(("http://", "https://")):
+            print("⚠️ CUSTOM_URL должен начинаться с http:// или https:// — провайдер пропущен")
+        else:
+            proto = clean_secret(os.environ.get("CUSTOM_PROTOCOL", "")).lower()
+            if proto == "google":
+                proto = "gemini"
+            if proto not in PROTOCOLS:
+                if proto:
+                    print(f"⚠️ CUSTOM_PROTOCOL={proto}: знаю только openai/anthropic/gemini — беру openai")
+                proto = "openai"
+            cname = clean_secret(os.environ.get("CUSTOM_NAME", "")) or "Мой провайдер"
+            base_name, n = cname, 2
+            while any(p["name"] == cname for p in providers.values()):
+                cname = f"{base_name} {n}"
+                n += 1
+            providers["ec"] = {
+                "name": cname,
+                "protocol": proto,
+                "base_url": c_url,
+                "api_key": clean_secret(os.environ.get("CUSTOM_KEY", "")),
+                "enabled": True,
+            }
+            names.append(f"ec={cname}")
+            cm = clean_secret(os.environ.get("CUSTOM_MODEL", ""))
+            if cm and not os.environ.get("DEFAULT_MODEL", "").strip():
+                cfg["default"] = {"provider": "ec", "model": cm}
+                names.append(f"по умолчанию: {cm}")
 
     # модель по умолчанию из окружения (DEFAULT_MODEL / DEFAULT_PROVIDER)
     dm = os.environ.get("DEFAULT_MODEL", "").strip()
@@ -1186,7 +1221,9 @@ class App:
             rows.append(row)
         await self.send(
             chat_id,
-            "🧩 Подключение провайдера.\nВыберите пресет — останется вставить только API-ключ:",
+            "🧩 Подключение провайдера.\n"
+            "«Свой сервер» — любой ваш URL и ключ, ни от кого не зависит.\n"
+            "Остальные — пресеты: выбрал → вставил только API-ключ:",
             self.kb(rows),
         )
 

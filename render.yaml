@@ -23,6 +23,14 @@ services:
         sync: false
       - key: PROVIDER_2
         sync: false
+      # Свой провайдер с произвольным URL (без пресетов):
+      #   CUSTOM_URL=https://api.мой-сервер.com/v1
+      #   CUSTOM_PROTOCOL=openai|anthropic|gemini (по умолчанию openai)
+      #   CUSTOM_NAME / CUSTOM_MODEL — имя в меню и модель по умолчанию
+      - key: CUSTOM_URL
+        sync: false
+      - key: CUSTOM_KEY
+        sync: false
       - key: DEFAULT_MODEL   # модель по умолчанию, напр. deepseek-chat, openai/gpt-4o-mini
         sync: false
       - key: SYSTEM_PROMPT
