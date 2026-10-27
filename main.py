@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Telegram-бот «Умный сканер документов + AI».
+Telegram-бот «Сканер документов».
 
-Повторяет ВСЕ функции оригинального Flask-приложения
-Smart Document Scanner & AI Text Enhancer (TA-SCANNER):
+Повторяет функции оригинального Flask-приложения
+Smart Document Scanner & AI Text Enhancer (TA-SCANNER) — БЕЗ AI-обработки:
 
-  1. Загрузка изображения (PNG/JPG/JPEG/WEBP)      -> фото или файл в Telegram
-  2. Перспективная коррекция (4-point transform)   -> scanner.process_document()
-  3. Фильтры: Ч/Б (adaptive threshold) / серый / цвет -> инлайн-кнопки, пересчёт
-  4. OCR (Tesseract)                               -> scanner.perform_ocr() (rus+eng)
-  5. AI-улучшение текста                           -> ai_enhancer (GLM, как Llama в оригинале)
-  6. Скачивание обработанного изображения          -> кнопка «Скачать JPG» (файлом)
-  7. Копирование сырого и AI-текста                -> кнопки с текстом для копирования
-
-Дополнительно:
-  /pdf   — собрать все обработанные страницы сессии в один PDF-файл
-  /clear — очистить очередь PDF и историю результатов
+  1. Загрузка изображения (PNG/JPG/JPEG/WEBP, до 16 МБ) -> фото или файл в Telegram
+  2. Идеальное выравнивание: перспектива (4-point transform) + доворот
+     до строго горизонтального текста
+  3. Фильтры: Ч/Б (без точек, со сглаживанием) / серый / цвет -> инлайн-кнопки
+  4. OCR (Tesseract, рус+англ) — чистый текст ЦЕЛИКОМ, как в веб-версии
+  5. Если на листе замечена таблица — бот СПРАШИВАЕТ, что распознать:
+     «📊 Распознать таблицу» или «📄 Весь лист»
+  6. Скачивание обработанного изображения -> кнопка «⬇️ Скачать JPG»
+  7. Сборка страниц в PDF -> /pdf и кнопка «➕ В PDF»
 """
 import os
 import sys
@@ -54,8 +52,7 @@ from telegram.ext import (
 )
 
 import scanner
-from ai_enhancer import enhance_text_with_ai
-from scanner import FILTER_KEYS, FILTER_LABELS_RU
+from scanner import FILTER_KEYS, FILTER_LABELS_RU, detect_content_type, extract_table_text
 
 DEFAULT_FILTER = "adaptive_threshold"  # как в оригинальной форме
 
@@ -67,13 +64,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("doc-scanner-bot")
 
 WELCOME = (
-    "📄 <b>Умный сканер документов + AI</b>\n\n"
+    "📄 <b>Сканер документов</b>\n\n"
     "Пришлите мне <b>фото документа</b> или <b>файл</b> (PNG / JPG / WEBP) — я:\n\n"
-    "1️⃣ Выровняю перспективу, как настоящий сканер\n"
-    "2️⃣ Применю фильтр: ⚫ Ч/Б / ◻ серый / 🎨 цвет\n"
-    "3️⃣ Распознаю текст (русский + английский)\n"
-    "4️⃣ Улучшу и причешу текст с помощью AI\n"
-    "5️⃣ Отдам JPG-файл, текст для копирования и соберу PDF\n\n"
+    "1️⃣ Идеально выровняю документ — перспектива + доворот текста\n"
+    "    до строго горизонтального положения, как настоящий сканер\n"
+    "2️⃣ Применю фильтр: ⚫ Ч/Б (без точек, со сглаживанием) / ◻ серый / 🎨 цвет\n"
+    "3️⃣ Распознаю текст (русский + английский) и пришлю его целиком,\n"
+    "    чистыми строками — как в веб-версии, без изменений\n"
+    "4️⃣ Если замечу на листе таблицу — спрошу, что распознать:\n"
+    "    📊 таблицу по ячейкам или 📄 весь лист целиком\n"
+    "5️⃣ Отдам JPG-файл и соберу страницы в PDF\n\n"
     "<b>Команды:</b>\n"
     "• /filter — выбрать фильтр по умолчанию\n"
     "• /pdf — собрать очередь страниц в один PDF\n"
@@ -97,9 +97,7 @@ def split_text(text: str, limit: int = 3800):
     text = text or ""
     chunks = []
     while len(text) > limit:
-        cut = text.rfind("\n\n", 0, limit)
-        if cut < limit // 2:
-            cut = text.rfind("\n", 0, limit)
+        cut = text.rfind("\n", 0, limit)
         if cut < limit // 2:
             cut = limit
         chunks.append(text[:cut])
@@ -113,19 +111,24 @@ def result_keyboard(rid: str, pdf_count: int = 0) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton("⬇️ Скачать JPG", callback_data=f"jpg:{rid}"),
-            InlineKeyboardButton("📋 Сырой текст", callback_data=f"raw:{rid}"),
+            InlineKeyboardButton("📋 Текст", callback_data=f"text:{rid}"),
         ],
         [
-            InlineKeyboardButton("✨ AI-текст", callback_data=f"ai:{rid}"),
             InlineKeyboardButton("🎨 Сменить фильтр", callback_data=f"refilter:{rid}"),
-        ],
-        [
             InlineKeyboardButton(f"➕ В PDF ({pdf_count})", callback_data=f"pdfadd:{rid}"),
         ],
     ]
     if pdf_count > 0:
         rows.append([InlineKeyboardButton("📑 Собрать PDF сейчас", callback_data="pdfbuild")])
     return InlineKeyboardMarkup(rows)
+
+
+def ask_keyboard(rid: str) -> InlineKeyboardMarkup:
+    """Вопрос при обнаружении таблицы: распознать таблицу или весь лист."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📊 Распознать таблицу", callback_data=f"tabocr:{rid}"),
+        InlineKeyboardButton("📄 Весь лист", callback_data=f"pageocr:{rid}"),
+    ]])
 
 
 def filter_keyboard(prefix: str, rid: str = "", current: str = "") -> InlineKeyboardMarkup:
@@ -149,25 +152,164 @@ def store_result(chat_data: dict, rid: str, data: dict):
             results.pop(old_rid, None)
 
 
-async def send_text_chunks(message_target, text: str, parse_mode=None, keyboard=None):
-    """Отправляет длинный текст по частям; клавиатура крепится к последней части."""
+async def a_send_chunks(message_target, text: str, keyboard=None):
     chunks = split_text(text)
     total = len(chunks)
     for i, chunk in enumerate(chunks):
-        last = i == total - 1
-        if last and keyboard is not None:
-            await message_target(chunk, parse_mode=parse_mode, reply_markup=keyboard)
+        if i == total - 1 and keyboard is not None:
+            await message_target(chunk, reply_markup=keyboard)
         else:
-            await message_target(chunk, parse_mode=parse_mode)
+            await message_target(chunk)
 
 
 # ----------------------------------------------------------------------------
 # Основной конвейер обработки (аналог POST-запроса в оригинальном приложении)
 # ----------------------------------------------------------------------------
 
+def scan_caption(res: dict, scanned, filt: str, kind: str = None,
+                 chars: int = None, ocr_err: str = None,
+                 awaiting: bool = False) -> str:
+    """Подпись к скану: что выровнено, какой фильтр, что определено."""
+    lines = ["✅ <b>Скан готов!</b>"]
+    if scanned is True:
+        lines.append("✂️ Документ выровнен: перспектива + доворот текста.")
+    elif scanned == "deskewed":
+        lines.append("🧭 Границы не найдены — выровнял наклон текста и обработал весь лист.")
+    else:
+        lines.append("⚠️ Границы документа не найдены — обработал изображение целиком.")
+    lines.append(f"🎨 Фильтр: <b>{FILTER_LABELS_RU.get(filt, filt)}</b>")
+    if awaiting:
+        lines.append(
+            f"📊 <b>На листе похоже есть таблица</b> — {res.get('rows', 0)} × {res.get('cols', 0)}."
+        )
+        lines.append("Что распознать? Выберите кнопкой под сканом 👇")
+        return "\n".join(lines)
+    if kind == "table":
+        lines.append(
+            f"📊 <b>Распознано: таблица</b> — {res.get('rows', 0)} строк × {res.get('cols', 0)} столбцов"
+        )
+    elif kind == "page":
+        lines.append("📄 <b>Определено: страница с текстом</b>")
+    if chars is not None:
+        lines.append(f"🔍 Распознано текста: {chars} символов" if chars else "🔍 Текст не найден")
+    if ocr_err:
+        lines.append(f"⚠️ OCR: {html.escape(ocr_err)}")
+    return "\n".join(lines)
+
+
+async def recognize_and_send(message, context: ContextTypes.DEFAULT_TYPE, rid: str,
+                             res: dict, processed, content: dict, mode: str):
+    """OCR выбранным способом + отправка чистого текста целиком.
+    Возвращает (kind, text, ocr_err)."""
+    ocr_err = None
+    if mode == "table":
+        await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+        out_text = await asyncio.to_thread(
+            extract_table_text, processed, content["h_lines"], content["v_lines"]
+        )
+        kind = "table"
+        if len(out_text.strip()) < 10:
+            # ячейки не распознались — OCR всей страницы (без линий сетки)
+            ocr_src = processed
+            if content.get("is_table"):
+                ocr_src = await asyncio.to_thread(scanner.remove_grid_lines, processed)
+            raw, ocr_err = await asyncio.to_thread(scanner.perform_ocr, ocr_src)
+            if raw and raw.strip():
+                out_text, kind = raw, "page"
+    else:
+        await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+        ocr_src = processed
+        if content.get("is_table"):
+            # На листе есть таблица, но нужен весь лист: убираем линии сетки,
+            # чтобы OCR прочитал и текст вокруг таблицы, и содержимое ячеек
+            ocr_src = await asyncio.to_thread(scanner.remove_grid_lines, processed)
+        raw, ocr_err = await asyncio.to_thread(scanner.perform_ocr, ocr_src)
+        out_text = raw or ""
+        kind = "page"
+
+    res.update({"text": out_text, "kind": kind, "ts": time.time()})
+
+    pdf_count = len(context.chat_data.get("pdf_pages", []))
+    if out_text.strip():
+        # Текст — ЦЕЛИКОМ, простым сообщением (копируется как есть)
+        await a_send_chunks(
+            message.reply_text,
+            out_text.rstrip(),
+            keyboard=result_keyboard(rid, pdf_count),
+        )
+    else:
+        await message.reply_text(
+            "🤔 Текст на изображении не найден.\n"
+            "Попробуйте другой режим или смените фильтр.",
+            reply_markup=result_keyboard(rid, pdf_count),
+        )
+    return kind, out_text, ocr_err
+
+
+async def handle_mode_choice(query, context: ContextTypes.DEFAULT_TYPE,
+                             rid: str, mode: str):
+    """Пользователь выбрал: распознавать таблицу или весь лист."""
+    res = context.chat_data.get("results", {}).get(rid)
+    if not res or not os.path.exists(res.get("proc", "")):
+        await query.message.reply_text("❌ Скан не найден — пришлите документ заново.")
+        return
+    processed = cv2.imread(res["proc"])
+    if processed is None:
+        await query.message.reply_text("❌ Не удалось перечитать обработанное изображение.")
+        return
+    content = res.get("content") or {}
+    if mode == "table" and not content.get("is_table"):
+        mode = "page"
+
+    status = await query.message.reply_text(
+        "📊 Распознаю таблицу по ячейкам…"
+        if mode == "table" else
+        "🔍 Распознаю весь лист целиком (OCR: русский + английский)…"
+    )
+    try:
+        kind, out_text, ocr_err = await recognize_and_send(
+            query.message, context, rid, res, processed, content, mode
+        )
+    finally:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    # Обновляем подпись на скане (кнопки остаются — можно выбрать и другой режим)
+    try:
+        caption = scan_caption(
+            res, res.get("scanned"), res.get("filter", DEFAULT_FILTER),
+            kind=kind, chars=len(out_text.strip()), ocr_err=ocr_err,
+        )
+        await query.edit_message_caption(caption=caption, parse_mode="HTML")
+    except Exception:
+        pass
+
+
+async def finalize_scan(message, context: ContextTypes.DEFAULT_TYPE, rid: str,
+                        res: dict, processed, scanned, filt: str, content: dict):
+    """Отправка скана с подписью. Если таблица — спрашивает, что распознать,
+    иначе сразу распознаёт и присылает текст."""
+    chat_id = message.chat_id
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    with open(res["proc"], "rb") as f:
+        if content.get("is_table"):
+            # Спрашиваем пользователя: таблица или весь лист
+            caption = scan_caption(res, scanned, filt, awaiting=True)
+            await message.reply_photo(
+                photo=f, caption=caption, parse_mode="HTML",
+                reply_markup=ask_keyboard(rid),
+            )
+        else:
+            caption = scan_caption(res, scanned, filt, kind="page")
+            await message.reply_photo(photo=f, caption=caption, parse_mode="HTML")
+            await recognize_and_send(message, context, rid, res, processed, content, "page")
+
+
 async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
                            data: bytes, ext: str):
-    """Полный цикл: сохранение -> перспектива -> фильтр -> OCR -> AI -> отправка."""
+    """Цикл: сохранение -> выравнивание -> фильтр -> тип -> OCR -> отправка."""
     chat_id = update.effective_chat.id
     filt = context.chat_data.get("default_filter", DEFAULT_FILTER)
 
@@ -188,9 +330,9 @@ async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             )
             return
 
-        # 2. Перспективная коррекция + фильтр (process_document из оригинала)
+        # 2. Выравнивание (перспектива + доворот) + фильтр
         await progress.edit_text(
-            f"✂️ Выравниваю перспективу и применяю фильтр «{FILTER_LABELS_RU[filt]}»…"
+            f"✂️ Выравниваю документ и применяю фильтр «{FILTER_LABELS_RU[filt]}»…"
         )
         processed, scanned, err = await asyncio.to_thread(
             scanner.process_document, image_cv, filt
@@ -200,84 +342,35 @@ async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         proc_path = os.path.join(rdir, f"processed_{filt}.jpg")
-        ok = cv2.imwrite(proc_path, processed, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        ok = cv2.imwrite(proc_path, processed, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
         if not ok:
             await progress.edit_text("❌ Не удалось сохранить обработанное изображение.")
             return
 
-        # 3. OCR (Tesseract, rus+eng) — как в оригинале
-        await progress.edit_text("🔍 Распознаю текст (OCR: русский + английский)…")
-        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-        raw_text, ocr_err = await asyncio.to_thread(scanner.perform_ocr, processed)
+        # 3. Определение типа содержимого: страница или таблица
+        await progress.edit_text("🔎 Определяю, что это: страница с текстом или таблица…")
+        content = await asyncio.to_thread(detect_content_type, processed)
 
-        # 4. AI-улучшение текста — как enhance_text_with_ai в оригинале
-        ai_text, ai_err = None, None
-        if raw_text and raw_text.strip():
-            await progress.edit_text("✨ AI улучшает и форматирует текст… (10–40 сек)")
-            ai_text, ai_err = await asyncio.to_thread(enhance_text_with_ai, raw_text)
-
-        await progress.delete()
-
-        # 5. Отправка результатов
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-        caption_lines = ["✅ <b>Скан готов!</b>"]
-        if scanned:
-            caption_lines.append("✂️ Перспектива выровнена (4-point transform).")
-        else:
-            caption_lines.append("⚠️ Границы документа не найдены — обработал изображение целиком.")
-        caption_lines.append(f"🎨 Фильтр: <b>{FILTER_LABELS_RU[filt]}</b>")
-        if raw_text is not None:
-            caption_lines.append(f"🔍 OCR: {len(raw_text.strip())} символов")
-        if ocr_err:
-            caption_lines.append(f"⚠️ OCR: {html.escape(ocr_err)}")
-        if ai_err:
-            caption_lines.append(f"⚠️ {html.escape(ai_err)}")
-        if ai_text and raw_text is not None and raw_text.strip() == (ai_text or "").strip():
-            caption_lines.append("ℹ️ AI счёл текст уже чистым — улучшения не требуются.")
-
-        with open(proc_path, "rb") as f:
-            await update.message.reply_photo(
-                photo=f,
-                caption="\n".join(caption_lines),
-                parse_mode="HTML",
-            )
-
-        # AI-текст (для копирования) + клавиатура действий
         chat_data = context.chat_data
-        pdf_count = len(chat_data.get("pdf_pages", []))
-        store_result(chat_data, rid, {
+        res = {
             "dir": rdir,
             "orig": orig_path,
             "proc": proc_path,
             "filter": filt,
             "scanned": scanned,
-            "raw": raw_text,
-            "ai": ai_text,
+            "text": "",
+            "kind": None,
+            "rows": content.get("rows", 0),
+            "cols": content.get("cols", 0),
+            "content": content if content.get("is_table") else None,
             "ts": time.time(),
-        })
+        }
+        store_result(chat_data, rid, res)
+        await progress.delete()
 
-        if ai_text and ai_text.strip():
-            header = "✨ <b>AI-улучшенный текст</b> (можно копировать):\n\n"
-            await send_text_chunks(
-                update.message.reply_text,
-                header + ai_text.strip(),
-                parse_mode="HTML",
-                keyboard=result_keyboard(rid, pdf_count),
-            )
-        elif raw_text and raw_text.strip():
-            header = "📋 <b>Распознанный текст</b> (AI-улучшение недоступно):\n\n"
-            await send_text_chunks(
-                update.message.reply_text,
-                header + html.escape(raw_text.strip()),
-                parse_mode="HTML",
-                keyboard=result_keyboard(rid, pdf_count),
-            )
-        else:
-            await update.message.reply_text(
-                "🤔 Текст на изображении не найден.\n"
-                "Попробуйте фото с более чётким текстом или смените фильтр.",
-                reply_markup=result_keyboard(rid, pdf_count),
-            )
+        # 4. Скан + подпись (+ вопрос, если таблица; + текст, если страница)
+        await finalize_scan(update.message, context, rid, res, processed,
+                            scanned, filt, content)
 
     except Exception as e:
         log.exception("Ошибка обработки: %s", e)
@@ -405,31 +498,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     try:
-        if data.startswith("raw:"):
+        if data.startswith("text:"):
             rid = data.split(":", 1)[1]
             res = context.chat_data.get("results", {}).get(rid)
-            if not res or not res.get("raw") or not res["raw"].strip():
-                await query.message.reply_text("📋 Сырой текст не сохранился или пуст.")
+            if not res or not res.get("text") or not res["text"].strip():
+                await query.message.reply_text("📋 Текст не сохранился или пуст.")
                 return
-            await send_text_chunks(
-                query.message.reply_text,
-                "📋 <b>Сырой текст (OCR)</b> — копируйте целиком:\n\n"
-                + html.escape(res["raw"].strip()),
-                parse_mode="HTML",
-            )
-
-        elif data.startswith("ai:"):
-            rid = data.split(":", 1)[1]
-            res = context.chat_data.get("results", {}).get(rid)
-            if not res or not res.get("ai") or not res["ai"].strip():
-                await query.message.reply_text("✨ AI-текст недоступен (пустой OCR или ошибка AI).")
-                return
-            await send_text_chunks(
-                query.message.reply_text,
-                "✨ <b>AI-улучшенный текст</b> — копируйте целиком:\n\n"
-                + html.escape(res["ai"].strip()),
-                parse_mode="HTML",
-            )
+            await a_send_chunks(query.message.reply_text, res["text"].strip())
 
         elif data.startswith("jpg:"):
             rid = data.split(":", 1)[1]
@@ -445,11 +520,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption="⬇️ Обработанное изображение (без сжатия Telegram)",
                 )
 
+        elif data.startswith("tabocr:") or data.startswith("pageocr:"):
+            mode = "table" if data.startswith("tabocr:") else "page"
+            rid = data.split(":", 1)[1]
+            await handle_mode_choice(query, context, rid, mode)
+
         elif data.startswith("refilter:"):
             rid = data.split(":", 1)[1]
             res = context.chat_data.get("results", {}).get(rid, {})
             await query.message.reply_text(
-                f"🎨 <b>Сменить фильтр</b> — пересчитаю этот документ заново:",
+                "🎨 <b>Сменить фильтр</b> — пересчитаю этот документ заново:",
                 parse_mode="HTML",
                 reply_markup=filter_keyboard("setf", rid=rid, current=res.get("filter", "")),
             )
@@ -520,60 +600,25 @@ async def refilter_result(query, context: ContextTypes.DEFAULT_TYPE, rid: str, n
         return
 
     proc_path = os.path.join(res["dir"], f"processed_{new_filter}.jpg")
-    cv2.imwrite(proc_path, processed, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    cv2.imwrite(proc_path, processed, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
 
-    raw_text, ocr_err = await asyncio.to_thread(scanner.perform_ocr, processed)
-    ai_text, ai_err = None, None
-    if raw_text and raw_text.strip():
-        await status.edit_text("✨ AI улучшает и форматирует текст… (10–40 сек)")
-        ai_text, ai_err = await asyncio.to_thread(enhance_text_with_ai, raw_text)
+    content = await asyncio.to_thread(detect_content_type, processed)
     await status.delete()
 
     res.update({
         "proc": proc_path,
         "filter": new_filter,
         "scanned": scanned,
-        "raw": raw_text,
-        "ai": ai_text,
+        "text": "",
+        "kind": None,
+        "rows": content.get("rows", 0),
+        "cols": content.get("cols", 0),
+        "content": content if content.get("is_table") else None,
         "ts": time.time(),
     })
 
-    caption_lines = ["✅ <b>Пересчитано!</b>"]
-    caption_lines.append("✂️ Перспектива выровнена." if scanned
-                         else "⚠️ Границы не найдены — обработан весь кадр.")
-    caption_lines.append(f"🎨 Фильтр: <b>{FILTER_LABELS_RU[new_filter]}</b>")
-    if ocr_err:
-        caption_lines.append(f"⚠️ OCR: {html.escape(ocr_err)}")
-    if ai_err:
-        caption_lines.append(f"⚠️ {html.escape(ai_err)}")
-
-    pdf_count = len(context.chat_data.get("pdf_pages", []))
-    with open(proc_path, "rb") as f:
-        await query.message.reply_photo(
-            photo=f,
-            caption="\n".join(caption_lines),
-            parse_mode="HTML",
-        )
-
-    if ai_text and ai_text.strip():
-        await send_text_chunks(
-            query.message.reply_text,
-            "✨ <b>AI-улучшенный текст</b> (можно копировать):\n\n" + html.escape(ai_text.strip()),
-            parse_mode="HTML",
-            keyboard=result_keyboard(rid, pdf_count),
-        )
-    elif raw_text and raw_text.strip():
-        await send_text_chunks(
-            query.message.reply_text,
-            "📋 <b>Распознанный текст</b>:\n\n" + html.escape(raw_text.strip()),
-            parse_mode="HTML",
-            keyboard=result_keyboard(rid, pdf_count),
-        )
-    else:
-        await query.message.reply_text(
-            "🤔 Текст не найден и с этим фильтром.",
-            reply_markup=result_keyboard(rid, pdf_count),
-        )
+    await finalize_scan(query.message, context, rid, res, processed,
+                        scanned, new_filter, content)
 
 
 async def build_and_send_pdf_from_callback(query, context: ContextTypes.DEFAULT_TYPE):
