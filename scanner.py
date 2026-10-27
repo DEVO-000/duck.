@@ -1,6 +1,6 @@
 """
-Сканер документов: находит лист на фото, выравнивает перспективу
-и делает чёрно-белый «скан».
+Сканер документов: находит лист (в том числе тетрадный, с почерком и клеткой)
+на фото, выравнивает перспективу и делает «скан».
 
 Установка:
     pip install opencv-python numpy
@@ -9,7 +9,7 @@
     python scanner.py photo.jpg                 -> photo_scan.png
     python scanner.py photo.jpg -o result.png
     python scanner.py photo.jpg --debug         (сохранит photo_debug.png с найденным контуром)
-    python scanner.py photo.jpg --mode gray     (серый скан вместо ч/б)
+    python scanner.py photo.jpg --mode gray     (bw — чёрно-белый, gray — серый, color — цветной)
 """
 
 import argparse
@@ -19,6 +19,10 @@ import sys
 import cv2
 import numpy as np
 
+MAX_SIDE = 2400  # длинная сторона готового скана, больше не нужно
+
+
+# ───────────────────────── геометрия ─────────────────────────
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     """Упорядочивает 4 точки: левый-верх, правый-верх, правый-низ, левый-низ."""
@@ -39,6 +43,7 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     tl, tr, br, bl = rect
     width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
     height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    width, height = max(width, 2), max(height, 2)
     dst = np.array(
         [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
         dtype="float32",
@@ -47,79 +52,159 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, m, (width, height))
 
 
+def _ellipse(k: int) -> np.ndarray:
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+
+
+def _quads_from_mask(mask: np.ndarray, min_area: float):
+    """Из бинарной маски достаёт четырёхугольники-кандидаты с оценкой."""
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, _ellipse(7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _ellipse(15))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:4]
+
+    out = []
+    for c in contours:
+        if cv2.contourArea(c) < min_area:
+            break
+        hull = cv2.convexHull(c)
+        hull_area = cv2.contourArea(hull)
+        peri = cv2.arcLength(hull, True)
+
+        quad = None
+        for eps in (0.01, 0.015, 0.02, 0.03, 0.04, 0.06, 0.08):
+            approx = cv2.approxPolyDP(hull, eps * peri, True)
+            if len(approx) == 4:
+                quad = approx.reshape(4, 2).astype("float32")
+                break
+            if len(approx) < 4:
+                break
+        if quad is None:
+            quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
+
+        qa = cv2.contourArea(quad)
+        if qa < min_area or hull_area <= 0:
+            continue
+        fit = min(qa, hull_area) / max(qa, hull_area)  # насколько выпуклая форма похожа на 4-угольник
+        out.append((quad, qa, qa * fit * fit))
+    return out
+
+
 def find_document_contour(image: np.ndarray):
-    """Ищет контур листа. Возвращает 4 точки в координатах исходного изображения."""
+    """
+    Ищет лист. Устойчиво к почерку и клетке: перед поиском границ «стираем»
+    тёмные тонкие линии морфологическим закрытием, поэтому внутренности листа
+    не мешают. Возвращает 4 точки в координатах исходного изображения.
+    """
     h, w = image.shape[:2]
     scale = 800.0 / max(h, w)
     small = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    img_area = small.shape[0] * small.shape[1]
+    sh, sw = small.shape[:2]
+    img_area = float(sh * sw)
 
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    k = max(9, (max(sh, sw) // 40) | 1)
+    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, _ellipse(k))  # убирает почерк и клетку
+    closed = cv2.GaussianBlur(closed, (7, 7), 0)
 
-    candidates = []
+    masks = []
 
-    # Вариант 1: границы (Canny)
-    edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)), iterations=2)
-    candidates.append(edges)
+    # 1) светлая бумага на более тёмном фоне
+    _, m = cv2.threshold(closed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    masks.append(m)
 
-    # Вариант 2: светлый лист на более тёмном фоне (Otsu + закрытие дыр)
-    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    otsu = cv2.morphologyEx(
-        otsu, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    )
-    candidates.append(otsu)
+    # 2) бумага почти бесцветная, стол/ткань — цветные
+    sat = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 1], (7, 7), 0)
+    _, m = cv2.threshold(sat, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    masks.append(m)
 
-    best = None
-    best_area = 0
-    for mask in candidates:
-        contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:8]
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < img_area * 0.15:
-                continue
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx) and area > best_area:
-                best, best_area = approx, area
+    # 3) границы на «очищенной» картинке
+    e = cv2.Canny(closed, 30, 90)
+    e = cv2.dilate(e, np.ones((3, 3), np.uint8), iterations=2)
+    e = cv2.morphologyEx(e, cv2.MORPH_CLOSE, _ellipse(9))
+    masks.append(e)
 
-    # Запасной вариант: минимальный повёрнутый прямоугольник вокруг самого большого контура
-    if best is None:
-        for mask in candidates:
-            contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-            c = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(c) >= img_area * 0.15:
-                best = cv2.boxPoints(cv2.minAreaRect(c))
-                break
+    best, best_score = None, 0.0
+    for mask in masks:
+        for quad, qa, score in _quads_from_mask(mask, img_area * 0.15):
+            if qa > img_area * 0.95:
+                score *= 0.85  # «весь кадр» — подозрительно, но возможно
+            if score > best_score:
+                best, best_score = quad, score
 
     if best is None:
         return None
-    return (best.reshape(4, 2) / scale).astype("float32")
+    return (best / scale).astype("float32")
 
 
-def to_black_white(image: np.ndarray, mode: str = "bw") -> np.ndarray:
-    """Превращает выровненное фото в скан."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+# ───────────────────────── обработка «под скан» ─────────────────────────
 
-    # Выравниваем неравномерное освещение: делим на сильно размытый фон
-    bg = cv2.medianBlur(cv2.dilate(gray, np.ones((7, 7), np.uint8)), 21)
-    norm = cv2.divide(gray, bg, scale=255)
+def _limit_size(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    k = MAX_SIDE / max(h, w)
+    if k < 1:
+        return cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    return img
+
+
+def _flatten_light(img: np.ndarray) -> np.ndarray:
+    """Убирает тени и неравномерный свет: делит картинку на оценку фона бумаги."""
+    h, w = img.shape[:2]
+    k = 600.0 / max(h, w)
+    small = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else img
+    ks = max(7, (max(small.shape[:2]) // 25) | 1)
+    bg = cv2.morphologyEx(small, cv2.MORPH_CLOSE, _ellipse(ks))  # стираем штрихи ручки
+    bg = cv2.GaussianBlur(bg, (0, 0), ks / 2)
+    bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+    bg = np.maximum(bg, 1)
+    return cv2.divide(img, bg, scale=255)
+
+
+def to_black_white(image: np.ndarray, mode: str = "bw", trim: float = 0.006) -> np.ndarray:
+    """
+    mode:
+      bw    — чистый чёрно-белый: клетка и шум убраны, текст остаётся
+      gray  — серый: бумага белая, почерк читаемый (лучше всего для рукописи)
+      color — цветной: бумага белая, ручка сохраняет цвет
+    """
+    # срезаем узкую полоску по краю — там часто остаётся кусок стола
+    h, w = image.shape[:2]
+    dy, dx = int(h * trim), int(w * trim)
+    if h - 2 * dy > 20 and w - 2 * dx > 20:
+        image = image[dy:h - dy, dx:w - dx]
+
+    image = _limit_size(image)
+    flat = _flatten_light(image)
+    gray = cv2.cvtColor(flat, cv2.COLOR_BGR2GRAY)
+
+    sample = gray[::4, ::4]
+    white = float(max(180.0, np.percentile(sample, 85)))   # уровень бумаги
+    ink = float(min(np.percentile(sample, 1), 130.0))      # уровень чернил
+
+    if mode == "color":
+        return cv2.convertScaleAbs(flat, alpha=255.0 / white)
 
     if mode == "gray":
-        return cv2.normalize(norm, None, 0, 255, cv2.NORM_MINMAX)
+        black = float(np.percentile(sample, 0.5))
+        scale = 255.0 / max(white - black, 1.0)
+        return cv2.convertScaleAbs(gray, alpha=scale, beta=-black * scale)
 
-    block = max(15, (min(norm.shape) // 25) | 1)
-    bw = cv2.adaptiveThreshold(
-        norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, block, 15
-    )
-    # убираем мелкий шум
-    bw = cv2.medianBlur(bw, 3)
-    return bw
+    # bw: порог между бумагой и чернилами; светлая клетка выше порога и пропадает
+    soft = cv2.GaussianBlur(gray, (0, 0), 0.8)
+    thr = white - 0.5 * (white - ink)
+    ink_mask = (soft < thr).astype(np.uint8)
 
+    # выкидываем мелкие «точки» (шум JPEG, фактура бумаги)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink_mask, connectivity=8)
+    min_area = max(12, int(ink_mask.shape[0] * ink_mask.shape[1] * 1.2e-5))
+    keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+    keep[0] = False
+    ink_mask = keep[labels]
+
+    return np.where(ink_mask, 0, 255).astype(np.uint8)
+
+
+# ───────────────────────── командная строка ─────────────────────────
 
 def scan(path: str, out: str, mode: str = "bw", debug: bool = False) -> None:
     image = cv2.imread(path)
@@ -148,7 +233,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Сканер документов по фото")
     p.add_argument("input", help="путь к фото")
     p.add_argument("-o", "--output", help="куда сохранить результат")
-    p.add_argument("--mode", choices=["bw", "gray"], default="bw", help="bw — чёрно-белый, gray — серый")
+    p.add_argument("--mode", choices=["bw", "gray", "color"], default="bw")
     p.add_argument("--debug", action="store_true", help="сохранить картинку с найденным контуром")
     args = p.parse_args()
 
