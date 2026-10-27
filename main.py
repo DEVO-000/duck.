@@ -195,7 +195,8 @@ async def cmd_start(m: Message):
         "Если лист нашёлся неточно, под результатом есть кнопка «✋ Поправить вручную».\n\n"
         "Режимы:\n"
         "/bw — чёрно-белый (по умолчанию)\n"
-        "/gray — серый, лучше для фото и рисунков"
+        "/gray — серый, лучше для рукописного текста\n"
+        "/color — цветной: бумага белая, ручка остаётся цветной"
     )
 
 
@@ -209,6 +210,12 @@ async def cmd_bw(m: Message):
 async def cmd_gray(m: Message):
     user_mode[m.from_user.id] = "gray"
     await m.answer("Режим: серый ✅")
+
+
+@dp.message(Command("color"))
+async def cmd_color(m: Message):
+    user_mode[m.from_user.id] = "color"
+    await m.answer("Режим: цветной ✅")
 
 
 async def handle_image(m: Message, file_id: str, size):
