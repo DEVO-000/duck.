@@ -52,6 +52,7 @@ def api_process():
         "do_perspective": request.form.get("perspective", "1") == "1",
         "do_skew": request.form.get("skew", "1") == "1",
         "do_enhance": request.form.get("enhance", "1") == "1",
+        "scan_mode": request.form.get("scan", "1") == "1",
     }
 
     t0 = time.time()
