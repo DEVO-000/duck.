@@ -1,13 +1,7 @@
 services:
   - type: web
-    name: scanner-bot
+    name: image-align-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    healthCheckPath: /health
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: BOT_TOKEN
-        sync: false
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
