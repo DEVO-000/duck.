@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Бот выравнивания и улучшения изображений</title>
+<style>
+  :root {
+    --bg: #0f1218; --card: #171c26; --line: #262d3b;
+    --text: #e8ecf4; --muted: #93a0b4; --accent: #4f8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 60px; }
+  header h1 { font-size: 26px; font-weight: 700; }
+  header p { color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px; margin-top: 22px;
+  }
+  #drop {
+    border: 2px dashed var(--line); border-radius: 12px; padding: 36px 20px;
+    text-align: center; color: var(--muted); cursor: pointer;
+    transition: border-color .2s, color .2s; line-height: 1.5;
+  }
+  #drop.hover { border-color: var(--accent); color: var(--text); }
+  #file { display: none; }
+  .opts { display: flex; flex-wrap: wrap; gap: 18px; margin: 18px 2px 4px; }
+  .opts label {
+    display: flex; gap: 8px; align-items: center; color: var(--muted);
+    font-size: 14px; cursor: pointer; line-height: 1.2;
+  }
+  .opts input { accent-color: var(--accent); width: 16px; height: 16px; }
+  button.primary {
+    background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+    padding: 13px 28px; font-size: 16px; font-weight: 600; cursor: pointer;
+    margin-top: 14px;
+  }
+  button.primary:disabled { opacity: .45; cursor: default; }
+  .spin { display: none; margin-top: 14px; color: var(--muted); font-size: 14px; }
+  #err { color: #ff8585; margin-top: 12px; display: none; font-size: 14px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+  .chip {
+    background: #1d2533; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 999px; padding: 6px 12px; font-size: 13px; line-height: 1.2;
+  }
+  .chip.on { color: #cfe0ff; border-color: #35507f; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 14px; }
+  .pair figure {
+    background: #10151f; border: 1px solid var(--line);
+    border-radius: 12px; overflow: hidden; min-width: 0;
+  }
+  .pair figcaption {
+    padding: 10px 14px; font-size: 13px; color: var(--muted);
+    border-bottom: 1px solid var(--line);
+  }
+  .pair img { width: 100%; display: block; }
+  a.dl {
+    display: inline-block; margin-top: 18px; background: #1d2533;
+    border: 1px solid #35507f; color: #cfe0ff; padding: 11px 22px;
+    border-radius: 10px; text-decoration: none; font-size: 14px;
+  }
+  .foot { color: var(--muted); font-size: 13px; margin-top: 18px; line-height: 1.6; }
+  @media (max-width: 720px) { .pair { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Бот выравнивания и улучшения изображений</h1>
+    <p>Загрузите фото — бот сам найдёт границы, исправит наклон, перспективу
+    и деформацию, выровняет по горизонтали и вертикали и повысит чёткость.</p>
+  </header>
+
+  <div class="card">
+    <div id="drop">Перетащите изображение сюда<br>или нажмите, чтобы выбрать файл (JPG / PNG)</div>
+    <input id="file" type="file" accept="image/jpeg,image/png,image/webp">
+    <div class="opts">
+      <label><input type="checkbox" id="o-persp" checked> перспектива и деформация</label>
+      <label><input type="checkbox" id="o-skew" checked> выравнивание наклона</label>
+      <label><input type="checkbox" id="o-enh" checked> чёткость и качество</label>
+    </div>
+    <button class="primary" id="go" disabled>Обработать</button>
+    <div class="spin" id="spin">Обрабатываю… обычно 2–10 секунд</div>
+    <div id="err"></div>
+  </div>
+
+  <div class="card" id="result" style="display:none">
+    <div class="chips" id="chips"></div>
+    <div class="pair">
+      <figure><figcaption>До</figcaption><img id="before" alt="До"></figure>
+      <figure><figcaption>После</figcaption><img id="after" alt="После"></figure>
+    </div>
+    <a class="dl" id="dl" download="obrabotano.jpg" href="#">Скачать результат</a>
+  </div>
+
+  <p class="foot">Максимальный размер файла — 25 МБ. Большие изображения автоматически
+  уменьшаются до 3000 px по большей стороне.</p>
+</div>
+
+<script>
+(function () {
+  var drop = document.getElementById('drop');
+  var fileInput = document.getElementById('file');
+  var go = document.getElementById('go');
+  var spin = document.getElementById('spin');
+  var err = document.getElementById('err');
+  var result = document.getElementById('result');
+  var before = document.getElementById('before');
+  var after = document.getElementById('after');
+  var dl = document.getElementById('dl');
+  var chips = document.getElementById('chips');
+  var current = null;
+
+  drop.addEventListener('click', function () { fileInput.click(); });
+  ['dragover', 'dragenter'].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) {
+      e.preventDefault(); drop.classList.add('hover');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) {
+      e.preventDefault(); drop.classList.remove('hover');
+    });
+  });
+  drop.addEventListener('drop', function (e) {
+    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', function () {
+    if (fileInput.files.length) setFile(fileInput.files[0]);
+  });
+
+  function setFile(f) {
+    current = f;
+    var r = new FileReader();
+    r.onload = function () { before.src = r.result; };
+    r.readAsDataURL(f);
+    drop.textContent = 'Выбран файл: ' + f.name;
+    go.disabled = false;
+    result.style.display = 'none';
+    err.style.display = 'none';
+  }
+
+  go.addEventListener('click', function () {
+    if (!current) return;
+    go.disabled = true;
+    spin.style.display = 'block';
+    err.style.display = 'none';
+    var fd = new FormData();
+    fd.append('image', current);
+    fd.append('perspective', document.getElementById('o-persp').checked ? '1' : '0');
+    fd.append('skew', document.getElementById('o-skew').checked ? '1' : '0');
+    fd.append('enhance', document.getElementById('o-enh').checked ? '1' : '0');
+    fetch('/api/process', { method: 'POST', body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        spin.style.display = 'none';
+        go.disabled = false;
+        if (!j.ok) {
+          err.textContent = j.error || 'Ошибка обработки';
+          err.style.display = 'block';
+          return;
+        }
+        after.src = j.image;
+        dl.href = j.image;
+        chips.innerHTML = '';
+        (j.info.steps || []).forEach(function (s) {
+          var c = document.createElement('span');
+          c.className = 'chip on';
+          c.textContent = s;
+          chips.appendChild(c);
+        });
+        var t = document.createElement('span');
+        t.className = 'chip';
+        t.textContent = 'время: ' + j.seconds + ' с';
+        chips.appendChild(t);
+        result.style.display = 'block';
+      })
+      .catch(function () {
+        spin.style.display = 'none';
+        go.disabled = false;
+        err.textContent = 'Не удалось связаться с сервером';
+        err.style.display = 'block';
+      });
+  });
+})();
+</script>
+</body>
+</html>
