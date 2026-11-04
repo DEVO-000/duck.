@@ -37,7 +37,7 @@ def api_process():
         return jsonify({"ok": False, "error": "Файл не выбран"}), 400
 
     raw = request.files["image"].read()
-    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    img = bot_processor.load_image_bgr(raw)
     if img is None:
         return jsonify({"ok": False,
                         "error": "Формат не поддерживается (нужен JPG или PNG)"}), 400
@@ -52,6 +52,7 @@ def api_process():
         "do_perspective": request.form.get("perspective", "1") == "1",
         "do_skew": request.form.get("skew", "1") == "1",
         "do_enhance": request.form.get("enhance", "1") == "1",
+        "rotate_deg": int(request.form.get("rot", "0") or 0),
     }
 
     t0 = time.time()

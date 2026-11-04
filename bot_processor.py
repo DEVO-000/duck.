@@ -1,31 +1,54 @@
 # -*- coding: utf-8 -*-
 """
-Ядро бота обработки изображений (движок v2).
+Ядро бота обработки изображений документов.
 
 Полный конвейер:
-1) автоматический поиск границ документа/объекта и коррекция перспективы
-   (4-точечное преобразование; несколько путей поиска: контуры, пороги
-   Отсу/адаптивный, линии Хафа);
-2) выравнивание по горизонтали И вертикали:
-   - глобальный наклон — проекционным методом по строкам текста
-     (дисперсия горизонтальной проекции), страховка — медиана линий Хафа;
-   - построчное выпрямление (dewarp): локальный наклон строк измеряется
-     в вертикальных полосах и компенсируется сдвигами столбцов — убирает
-     трапецию и изгиб страницы, когда четырёхугольник не найден;
-   - выравнивание вертикальных линий (клетка, поля, края) аналогичным
-     методом по транспонированному изображению;
-3) повышение чёткости и качества: шумоподавление, выравнивание
-   освещённости и ОДНОТОННЫЙ фон (flat-field нормализация для любых
-   кадров — светлых и тёмных), заливка фона белым, обрезка полей,
-   усиление резкости.
+1) автоматический поиск границ листа и коррекция перспективы/деформации
+   (4-точечное преобразование). Кандидаты-границы собираются несколькими
+   методами: маска листа (геодезическая реконструкция фона), заливка фона
+   от кромки кадра, яркостные/цветовые маски, рёбра Canny. Выбранный квад
+   проверяется «по результату»: после выпрямления рамка должна быть светлой
+   (иначе квад захвата стол или врезался в текст);
+2) финальная доводка кадра «только лист»: обрезка по профилям яркости —
+   отрезаются только ряды/столбцы ФОНА (тёмные/цветные), светлые ряды
+   листа и текст не трогаются, контент потерять невозможно;
+3) автоматическое выравнивание по горизонтали И вертикали: угол ищется
+   проекционными профилями строк текста (знак надёжный, диапазон ±12°),
+   Хаф — только как подстраховка на малых углах;
+4) повышение чёткости: шумоподавление, выравнивание освещения (flat-field,
+   тени и виньетка), однотонный белый фон страницы, резкость.
 
 Запуск из командной строки:
     python bot_processor.py вход.jpg результат.jpg
 """
+import io
 import sys
 
 import cv2
 import numpy as np
+
+try:
+    from PIL import Image, ImageOps
+    _HAS_PIL = True
+except Exception:  # pragma: no cover
+    _HAS_PIL = False
+
+
+# ----------------------------------------------------------------------------
+# Загрузка с учётом EXIF-ориентации (телефонные фото)
+# ----------------------------------------------------------------------------
+
+def load_image_bgr(source):
+    """Читает изображение (путь к файлу ИЛИ bytes) с учётом EXIF-ориентации."""
+    if _HAS_PIL:
+        im = Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray))
+                        else source)
+        im = ImageOps.exif_transpose(im)
+        im = im.convert("RGB")
+        return np.asarray(im)[:, :, ::-1].copy()  # RGB -> BGR
+    if isinstance(source, (bytes, bytearray)):
+        return cv2.imdecode(np.frombuffer(source, np.uint8), cv2.IMREAD_COLOR)
+    return cv2.imread(source, cv2.IMREAD_COLOR)
 
 
 # ----------------------------------------------------------------------------
@@ -44,8 +67,8 @@ def order_points(pts):
     return rect
 
 
-def _expand_quad(pts, margin=0.008):
-    """Слегка расширяет четырёхугольник наружу, чтобы не срезать края документа."""
+def _expand_quad(pts, margin=0.014):
+    """Расширяет четырёхугольник наружу, чтобы не срезать край листа."""
     c = pts.mean(axis=0)
     return (c + (pts - c) * (1.0 + margin)).astype("float32")
 
@@ -70,305 +93,658 @@ def four_point_transform(image, pts):
 
 
 # ----------------------------------------------------------------------------
-# Поиск границ документа / объекта (v2: несколько путей + валидация)
+# Оценка освещённости (тени/виньетка убираются делением на гладкий фон)
 # ----------------------------------------------------------------------------
 
-def _quad_angles_ok(pts):
-    """Внутренние углы четырёхугольника в разумных пределах (55..125 градусов)."""
-    p = order_points(pts.astype(np.float32))
-    for i in range(4):
-        a = p[i]
-        b = p[(i + 1) % 4]
-        c = p[(i + 2) % 4]
-        v1 = b - a
-        v2 = c - b
-        cos = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-9))
-        ang = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
-        if ang < 55.0 or ang > 125.0:
-            return False
-    return True
+def _flat_field(gray, target=250.0, kfrac=0.12):
+    """Делит яркость на крупномасштабную оценку фона: тени/виньетка исчезают.
+
+    Оценка фона строится на уменьшенной копии (быстро и гладко): морфологическое
+    замыкание убирает текст/мелкие детали, блюр сглаживает оценку.
+    kfrac — доля меньшей стороны под ядро замыкания.
+    """
+    h, w = gray.shape
+    scale = max(1, int(round(min(h, w) / 240.0)))
+    sw, sh = max(16, int(round(w / scale))), max(16, int(round(h / scale)))
+    small = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    k = int(max(15, min(sw, sh) * kfrac))
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bg_s = cv2.morphologyEx(small, cv2.MORPH_CLOSE, kernel)
+    bg_s = cv2.GaussianBlur(bg_s, (0, 0), max(3.0, k / 5.0))
+    bg = cv2.resize(bg_s, (w, h), interpolation=cv2.INTER_LINEAR)
+    bgf = np.maximum(bg.astype(np.float32), 25.0)
+    return np.clip(gray.astype(np.float32) * (target / bgf), 0, 255).astype(np.uint8)
 
 
-def _quads_from_mask(mask, img_shape, min_area_ratio):
-    """Ищет самый большой выпуклый 4-угольник в бинарной маске (с перебором eps)."""
-    cnts, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+# ----------------------------------------------------------------------------
+# «Похоже на лист»: дистанция от цвета листа (яркость + цвет)
+# ----------------------------------------------------------------------------
+
+def _page_reference(lab):
+    """Опорный цвет листа: самый светлый из нескольких центральных зон.
+
+    Центр кадра почти всегда лист; тёмные рисунки/таблицы во весь лист
+    мешают, поэтому при подозрительно тёмных зонах берём самый светлый
+    квартил всего кадра (бумага — самый светлый крупный класс).
+    """
+    h, w = lab.shape[:2]
+    zones = [
+        (0.40, 0.40, 0.60, 0.60),   # центр
+        (0.30, 0.15, 0.50, 0.45),   # слева-выше
+        (0.50, 0.15, 0.70, 0.45),   # справа-выше
+        (0.30, 0.55, 0.50, 0.85),   # слева-ниже
+        (0.50, 0.55, 0.70, 0.85),   # справа-ниже
+    ]
+    best = None
+    best_l = -1.0
+    for (y0, x0, y1, x1) in zones:
+        p = lab[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+        if p.size == 0:
+            continue
+        ml = float(np.median(p[:, :, 0]))
+        if ml > best_l:
+            best_l = ml
+            best = (ml, float(np.median(p[:, :, 1])), float(np.median(p[:, :, 2])))
+    if best is None or best_l < 170.0:
+        # зоны тёмные (таблицы/рисунки во весь лист): берём светлый квартил
+        lv = lab[:, :, 0].astype(np.float32)
+        t75 = float(np.percentile(lv, 75))
+        bright_sel = lab[:, :, 0] >= t75
+        if bright_sel.any():
+            best = (float(np.percentile(lv[bright_sel], 90)),
+                    float(np.median(lab[:, :, 1][bright_sel])),
+                    float(np.median(lab[:, :, 2][bright_sel])))
+        else:
+            best = (200.0, 128.0, 128.0)
+    return best
+
+
+def _page_distance(image, ref=None):
+    """Карта «похожести на лист»: 255 = цвет листа, меньше = фон/стол.
+
+    Лист отличается от стола не только яркостью, но и ЦВЕТОМ (дерево теплее,
+    ткань синее). Тени предварительно убираются плоским полем по L, опорный
+    цвет листа оценивается по тому ЖЕ выровненному каналу (согласованность!),
+    затем считается дистанция в Lab. Такой образ различает даже светлый
+    стол, почти совпадающий с бумагой по яркости.
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l = _flat_field(lab[:, :, 0], target=250.0, kfrac=0.08)
+    a = cv2.GaussianBlur(lab[:, :, 1], (7, 7), 0)
+    b = cv2.GaussianBlur(lab[:, :, 2], (7, 7), 0)
+    stack = cv2.merge((l, a, b))
+    if ref is None:
+        ref = _page_reference(stack)
+    rl, ra, rb = ref
+    lf = l.astype(np.float32)
+    af = a.astype(np.float32)
+    bf = b.astype(np.float32)
+    dist = np.sqrt((lf - rl) ** 2
+                   + ((af - ra) ** 2 + (bf - rb) ** 2) * 1.6)
+    return np.clip(255.0 - dist * 2.0, 0, 255).astype(np.uint8), ref
+
+
+# ----------------------------------------------------------------------------
+# Маска листа: геодезическая реконструкция фона от кромки кадра
+# ----------------------------------------------------------------------------
+
+def _dist_stats(dist):
+    """Статистики карты похожести: центр (лист), кромка кадра (фон), порог.
+
+    Порог делит лист и стол ПОПОЛАМ между их типичными уровнями —
+    адаптивно: светлый стол близок к бумаге, и фиксированный порог
+    его не отделяет, а середина между кромкой и центром — отделяет.
+    """
+    h, w = dist.shape[:2]
+    ch0, ch1 = int(h * 0.30), int(h * 0.70)
+    cw0, cw1 = int(w * 0.30), int(w * 0.70)
+    center = float(np.median(dist[ch0:ch1, cw0:cw1]))
+    bh, bw = max(4, int(h * 0.08)), max(4, int(w * 0.08))
+    strips = np.concatenate([dist[:bh].ravel(), dist[-bh:].ravel(),
+                             dist[:, :bw].ravel(), dist[:, -bw:].ravel()])
+    border = float(np.median(strips))
+    t_split = float(np.clip(0.5 * (center + border), 200.0, 236.0))
+    return center, border, t_split
+
+
+def _geodesic_reconstruct(seed, allowed, iters=220):
+    """Растит маску от seed только по разрешённым пикселям (allowed).
+
+    Фон не может «просочиться» на лист: рост блокируется яркой полосой
+    самой страницы. Заменяет ненадёжную заливку с допуском по цвету.
+    """
+    bg = seed.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    for _ in range(iters):
+        nxt = cv2.dilate(bg, kernel)
+        np.bitwise_and(nxt, allowed, out=nxt)
+        if np.array_equal(nxt, bg):
+            break
+        bg = nxt
+    return bg
+
+
+def page_mask(image):
+    """Маска листа в кадре. Возвращает (маска uint8*255|None, доля площади).
+
+    1) карта похожести на лист (цвет листа vs всё остальное); 2) фон =
+    геодезическое расширение кромки кадра по НЕ-листу — на лист не
+    просачивается; 3) лист = дополнение фона, дырки залиты, оставлена
+    крупнейшая часть.
+    """
+    h, w = image.shape[:2]
+    if h < 200 or w < 200:
+        return None, 0.0
+
+    # уменьшенная копия для скорости
+    scale = max(1, int(round(max(h, w) / 640.0)))
+    sw, sh = max(64, w // scale), max(64, h // scale)
+    small = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
+    dist, ref = _page_distance(small)
+
+    # адаптивный порог: середина между кромкой (стол) и центром (лист)
+    center, border, t_split = _dist_stats(dist)
+    page_like = (dist > t_split).astype(np.uint8)
+    # закрытие ТОЛЬКО мелких дырок (штрихи текста); ядро маленькое,
+    # чтобы не «зашить» ажурные/текстурные фоны (кружево, ткань с узором)
+    close_k = 9
+    page_like = cv2.morphologyEx(
+        page_like, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k)))
+    non_page = (page_like == 0).astype(np.uint8)
+
+    # старт: кромка кадра, не похожая на лист
+    ring = np.zeros((sh, sw), np.uint8)
+    rb = max(3, int(0.05 * min(sh, sw)))
+    ring[:rb, :] = 1
+    ring[-rb:, :] = 1
+    ring[:, :rb] = 1
+    ring[:, -rb:] = 1
+    seed = (ring & non_page).astype(np.uint8)
+    if seed.sum() == 0:
+        # вся кромка похожа на лист — лист занимает весь кадр
+        return None, 1.0
+
+    bg = _geodesic_reconstruct(seed, non_page)
+    # фон не должен занять весь кадр (иначе порог «листа» никуда не годится)
+    bg_frac = float((bg > 0).mean())
+    if bg_frac > 0.96 or bg_frac < 0.02:
+        return None, 0.0
+
+    page = (bg == 0).astype(np.uint8) * 255
+    page = cv2.morphologyEx(page, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)))
+    page = cv2.morphologyEx(page, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    # дырки внутри листа (тёмные рисунки во всю ширину) заливаются:
+    # это компоненты НЕ-листа, не касающиеся границы кадра
+    inv = (page == 0).astype(np.uint8)
+    if inv.any():
+        n_cc, cc_lab = cv2.connectedComponents(inv, 8)
+        border_ids = set(np.unique(np.concatenate([
+            cc_lab[0, :], cc_lab[-1, :], cc_lab[:, 0], cc_lab[:, -1]])))
+        hole_ids = [i for i in range(1, n_cc) if i not in border_ids]
+        if hole_ids:
+            holes = np.isin(cc_lab, hole_ids)
+            page[holes] = 255
+
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(page, 8)
+    if n <= 1:
+        return None, 0.0
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = stats[i, cv2.CC_STAT_AREA]
+    if area < 0.05 * sh * sw:
+        return None, 0.0
+    m_small = (lab == i).astype(np.uint8) * 255
+    m = cv2.resize(m_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    return m, float((m > 0).mean())
+
+
+# ----------------------------------------------------------------------------
+# Поиск границ листа
+# ----------------------------------------------------------------------------
+
+def _mask_to_quads(mask, img_shape, min_area_ratio=0.08, max_quads=3):
+    """Из бинарной маски — кандидаты-четырёхугольники (страница может быть изогнута)."""
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        return None
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+        return []
     img_area = float(img_shape[0] * img_shape[1])
-    for c in cnts[:12]:
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+    out = []
+    for c in cnts[:6]:
+        area = cv2.contourArea(c)
+        if area < min_area_ratio * img_area or area > 0.995 * img_area:
+            continue
+        hull = cv2.convexHull(c)
+        peri = cv2.arcLength(hull, True)
+        if peri < 32:
+            continue
+        quad = None
+        for eps_rel in (0.02, 0.04, 0.07, 0.11):
+            approx = cv2.approxPolyDP(hull, eps_rel * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quad = approx.reshape(4, 2).astype("float32")
+                break
+        if quad is None:
+            # изогнутый/рваный край: вписанный прямоугольник по выпуклой оболочке
+            quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
+        out.append(quad)
+        if len(out) >= max_quads:
+            break
+    return out
+
+
+def _edge_quads(gray_norm, img_shape, min_area_ratio=0.08):
+    """Кандидаты по рёбрам Canny (нормализованная копия — границы контрастнее)."""
+    blur = cv2.GaussianBlur(gray_norm, (5, 5), 0)
+    edged = cv2.Canny(blur, 40, 120)
+    edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=2)
+    cnts, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return []
+    img_area = float(img_shape[0] * img_shape[1])
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+    out = []
+    for c in cnts[:14]:
         area = cv2.contourArea(c)
         if area < min_area_ratio * img_area or area > 0.995 * img_area:
             continue
         peri = cv2.arcLength(c, True)
-        for eps in (0.02, 0.035, 0.05, 0.07):
-            approx = cv2.approxPolyDP(c, eps * peri, True)
+        for eps_rel in (0.02, 0.03, 0.05):
+            approx = cv2.approxPolyDP(c, eps_rel * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
-                pts = approx.reshape(4, 2).astype("float32")
-                if _quad_angles_ok(pts):
-                    return pts
-    return None
+                out.append(approx.reshape(4, 2).astype("float32"))
+                break
+        if len(out) >= 5:
+            break
+    return out
 
 
-def _quad_from_hough_lines(image):
-    """Строит четырёхугольник из длинных линий Хафа: верх/низ/лево/право.
+def _quad_score(gray, quad, img_shape):
+    """Оценивает, насколько четырёхугольник похож на ГРАНИЦУ ЛИСТА.
 
-    Выручает, когда контур документа не замыкается (тёмные фото, доски,
-    пёстрый фон), но рёбра объекта дают сильные прямые линии.
+    Главный признак — перепад яркости через край: сразу внутри листа светло,
+    сразу снаружи (стол/клеёнка) темнее. Внутренние рамки таблиц и блоки
+    текста такого перепада не дают. Стороны, ушедшие за рамку кадра (лист
+    вплотную к краю), не штрафуются — внешней полосы там просто нет.
     """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(blur)
-    edges = cv2.Canny(eq, 50, 150)
-    h, w = edges.shape
-    lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180.0,
-        threshold=max(80, w // 12),
-        minLineLength=max(90, int(w * 0.22)),
-        maxLineGap=30,
-    )
-    if lines is None:
-        return None
-    hl, vl = [], []
-    for x1, y1, x2, y2 in lines[:, 0, :]:
-        ln = float(np.hypot(x2 - x1, y2 - y1))
-        ang = np.degrees(np.arctan2(float(y2 - y1), float(x2 - x1))) % 180.0
-        if (ang <= 25.0 or ang >= 155.0) and ln >= w * 0.18:
-            hl.append((ln, (x1, y1), (x2, y2)))
-        elif 65.0 <= ang <= 115.0 and ln >= h * 0.18:
-            vl.append((ln, (x1, y1), (x2, y2)))
-    if len(hl) < 2 or len(vl) < 2:
-        return None
-    hl.sort(key=lambda t: -t[0])
-    vl.sort(key=lambda t: -t[0])
-    top = min(hl[:5], key=lambda t: (t[1][1] + t[2][1]) / 2.0)
-    bot = max(hl[:5], key=lambda t: (t[1][1] + t[2][1]) / 2.0)
-    left = min(vl[:5], key=lambda t: (t[1][0] + t[2][0]) / 2.0)
-    right = max(vl[:5], key=lambda t: (t[1][0] + t[2][0]) / 2.0)
-    if (top is bot) or (left is right):
-        return None
+    h, w = img_shape[:2]
+    pts = quad.astype(np.float32)
+    area = cv2.contourArea(pts.astype(np.int32))
+    img_area = float(h * w)
+    cover = area / img_area
+    if cover < 0.06 or cover > 1.20:
+        return -1e9
 
-    def line_params(p1, p2):
-        (x1, y1), (x2, y2) = p1, p2
-        a, b, c = float(y2 - y1), float(x1 - x2), float(x1 * y2 - x2 * y1)
-        return a, b, c
-
-    def inter(l1, l2):
-        a1, b1, c1 = line_params(*l1)
-        a2, b2, c2 = line_params(*l2)
-        d = a1 * b2 - a2 * b1
-        if abs(d) < 1e-9:
-            return None
-        return (float((b1 * c2 - b2 * c1) / d), float((a2 * c1 - a1 * c2) / d))
-
-    corners = [
-        inter((top[1], top[2]), (left[1], left[2])),
-        inter((top[1], top[2]), (right[1], right[2])),
-        inter((bot[1], bot[2]), (right[1], right[2])),
-        inter((bot[1], bot[2]), (left[1], left[2])),
-    ]
-    if any(c is None for c in corners):
-        return None
-    quad = np.array(corners, dtype="float32")
-    # углы за пределами кадра с запасом -> линия не от документа
-    pad = 0.12
-    if (quad < [-w * pad, -h * pad]).any() or (quad > [w * (1 + pad), h * (1 + pad)]).any():
-        return None
-    area = cv2.contourArea(quad)
-    if area < 0.10 * w * h:
-        return None
-    if not _quad_angles_ok(quad):
-        return None
-    return quad
-
-
-def _quad_from_hull(mask, img_shape):
-    """Ориентированный прямоугольник вокруг самого большого контура (последний шанс)."""
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < 0.12 * img_shape[0] * img_shape[1]:
-        return None
-    rect = cv2.minAreaRect(c)
-    pts = cv2.boxPoints(rect).astype("float32")
-    if _quad_angles_ok(pts):
-        return pts
-    return None
-
-
-def _near_frame(quad, shape, tol=0.035, area_frac=0.90):
-    """True, если четырёхугольник практически совпадает с рамкой кадра."""
-    h, w = shape[:2]
-    corners = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], np.float32)
-    q = order_points(quad.astype(np.float32))
-    if cv2.contourArea(q) < area_frac * w * h:
-        return False
+    # прямоугольность: отклонение углов от 90°
+    d = np.roll(pts, -1, axis=0) - pts
+    ang_dev = 0.0
     for i in range(4):
-        if np.linalg.norm(q[i] - corners[i]) > tol * max(w, h):
+        v1, v2 = d[i - 1], d[i]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 < 1e-6 or n2 < 1e-6:
+            return -1e9
+        cosang = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        ang_dev += abs(np.degrees(np.arccos(cosang)) - 90.0)
+    ang_dev /= 4.0
+
+    # полосы вдоль сторон: внутри и снаружи (по одной паре на сторону)
+    strip = max(6.0, 0.015 * min(h, w))
+    c = pts.mean(axis=0)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+
+    drops, grads, far_page = [], [], []
+    t = np.linspace(0.08, 0.92, 48)  # вдоль стороны, не задевая углы
+    for i in range(4):
+        p1, p2 = pts[i], pts[(i + 1) % 4]
+        mid = 0.5 * (p1 + p2)
+        direction = p2 - p1
+        nrm = np.array([-direction[1], direction[0]], dtype=np.float32)
+        nn = np.linalg.norm(nrm)
+        if nn < 1e-6:
+            return -1e9
+        nrm /= nn
+        if np.dot(mid - c, nrm) < 0:  # нормаль наружу от центра
+            nrm = -nrm
+        base = p1 + (p2 - p1) * t[:, None]
+        inner_px, outer_px, far_px = [], [], []
+        for k in range(4):  # полоса из 4 линий с каждой стороны
+            off_in = -strip * (1.6 - 0.35 * k)
+            off_out = strip * (0.4 + 0.35 * k)
+            off_far = strip * (3.2 + 0.6 * k)
+            for off, store in ((off_in, inner_px), (off_out, outer_px),
+                               (off_far, far_px)):
+                xy = base + nrm * off
+                xi = np.round(xy[:, 0]).astype(int)
+                yi = np.round(xy[:, 1]).astype(int)
+                ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+                if ok.sum() < 8:
+                    continue
+                store.append(gray[yi[ok], xi[ok]])
+        if inner_px and outer_px:
+            drops.append(float(np.concatenate(inner_px).mean()
+                               - np.concatenate(outer_px).mean()))
+        # далеко снаружи снова «лист»? значит квад врезан в страницу:
+        # за границей настоящего листа лежит стол, а не бумага
+        if far_px:
+            far_page.append(float(np.concatenate(far_px).mean()))
+        # градиент вдоль самой стороны
+        xi = np.round(base[:, 0]).astype(int)
+        yi = np.round(base[:, 1]).astype(int)
+        ok = (xi >= 0) & (xi < w) & (yi >= 0) & (yi < h)
+        if ok.sum() > 15:
+            grads.append(float(mag[yi[ok], xi[ok]].mean()))
+
+    drop = float(np.mean(drops)) if drops else 0.0
+    grad = float(np.mean(grads)) if grads else 0.0
+    # штраф за «страницоподобную» дальнюю полосу снаружи
+    far_pen = 0.0
+    if far_page:
+        far_frac = float(np.mean([f > 218.0 for f in far_page]))
+        far_pen = 2.0 * far_frac
+
+    cover_score = 1.0 if 0.25 <= cover <= 0.96 else max(0.0, 1.0 - abs(cover - 0.6))
+    rect_score = max(0.0, 1.0 - ang_dev / 40.0)
+    score = (3.0 * np.clip(drop / 22.0, -1.0, 1.0)
+             + 1.2 * cover_score
+             + 1.0 * rect_score
+             + 0.8 * np.clip(grad / 25.0, 0.0, 1.0)
+             - far_pen)
+    return float(score)
+
+
+def _warp_verify(image, quad):
+    """Проверка кандидата «по результату»: выпрямляем и смотрим рамку.
+
+    Правильный квад листа после выпрямления даёт ПОХОЖУЮ НА ЛИСТ полосу по
+    внутренним кромкам (поля страницы). Чужая полоса = в квад попал стол.
+    Стороны, прижатые к границе кадра, не проверяются. Допуск мягкий:
+    тетради со спиралями и линейками имеют тёмные поля у края.
+    """
+    h, w = image.shape[:2]
+    rect = order_points(quad.astype("float32"))
+    scale = 420.0 / max(h, w)
+    small = cv2.resize(image, (int(w * scale), int(h * scale))) if scale < 1 else image
+    q = rect * (scale if scale < 1 else 1.0)
+    prev = four_point_transform(small, q)
+    if prev.shape[0] < 60 or prev.shape[1] < 60:
+        return False
+    g, _ = _page_distance(prev)
+    ph, pw = g.shape
+    ph_in, pw_in = max(3, int(ph * 0.03)), max(3, int(pw * 0.03))
+    bands = {
+        'top': g[ph_in:ph_in * 2, pw // 4: 3 * pw // 4],
+        'bottom': g[-2 * ph_in:-ph_in, pw // 4: 3 * pw // 4],
+        'left': g[ph // 4: 3 * ph // 4, pw_in:2 * pw_in],
+        'right': g[ph // 4: 3 * ph // 4, -2 * pw_in:-pw_in],
+    }
+    # стороны квада, прижатые к кромке кадра, пропускаем
+    near = 0.04
+    sides_open = []
+    order = [(0, 'top'), (1, 'right'), (2, 'bottom'), (3, 'left')]
+    for idx, name in order:
+        p1, p2 = rect[idx], rect[(idx + 1) % 4]
+        if name == 'top':
+            d = min(p1[1], p2[1]) / h
+        elif name == 'bottom':
+            d = 1.0 - max(p1[1], p2[1]) / h
+        elif name == 'left':
+            d = min(p1[0], p2[0]) / w
+        else:
+            d = 1.0 - max(p1[0], p2[0]) / w
+        sides_open.append((name, d < near))
+    for name, open_side in sides_open:
+        if open_side:
+            continue
+        band = bands[name]
+        if band.size == 0:
+            continue
+        if float(band.mean()) < 150.0 or float((band < 140).mean()) > 0.30:
             return False
     return True
 
 
-def find_document_contour(image, min_area_ratio=0.10):
-    """Находит главный четырёхугольник (страницу/объект) на фото.
+def _bg_complement_quads(image, img_shape):
+    """Кандидаты через заливку ФОНА от кромки кадра (цветовая связность).
 
-    Пути (до первого успеха):
-    1) порог Отсу после CLAHE — светлый документ на любом фоне;
-    2) контуры Canny после CLAHE — обычные и тёмные фото;
-    3) адаптивный порог — пёстрый фон, слабый контраст;
-    4) инвертированный Отсу — тёмный объект на светлом фоне;
-    5) длинные линии Хафа — рёбра объекта без замкнутого контура;
-    6) ориентированный прямоугольник вокруг крупнейшего контура.
-    Возвращает 4x2 точки, либо None (в т.ч. когда объект и так занимает
-    весь кадр — тогда выпрямление сделает блок dewarp).
+    Дополнительный метод: полезен, когда лист и стол различаются в первую
+    очередь цветом, а не яркостью.
+    """
+    h, w = img_shape[:2]
+    scale = max(1, int(round(max(h, w) / 700.0)))
+    sw, sh = max(64, w // scale), max(64, h // scale)
+    small = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_AREA)
+    bg = np.zeros((sh, sw), np.uint8)
+    total = float(sh * sw)
+    lo = (26, 11, 11)
+    up = (26, 11, 11)
+    step = max(2, int(min(sh, sw) / 60))
+    border_pts = []
+    for x in range(0, sw, step):
+        border_pts += [(x, 0), (x, sh - 1)]
+    for y in range(0, sh, step):
+        border_pts += [(0, y), (sw - 1, y)]
+    for (x, y) in border_pts:
+        if bg[y, x]:
+            continue
+        mask = np.zeros((sh + 2, sw + 2), np.uint8)
+        flags = 4 | (255 << 8) | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY
+        cv2.floodFill(small.copy(), mask, (x, y), (255, 255, 255),
+                      loDiff=lo, upDiff=up, flags=flags)
+        area = float((mask == 255).sum())
+        if area <= 0 or area > 0.34 * total:
+            continue  # заливка ушла на лист — не фон
+        bg |= mask[1:-1, 1:-1]
+    bg_frac = float((bg > 0).mean())
+    if bg_frac < 0.04 or bg_frac > 0.92:
+        return []  # фон не найден или «фон» — весь кадр
+    bg = cv2.dilate(bg, np.ones((5, 5), np.uint8), iterations=2)
+    page = cv2.bitwise_not(bg)
+    page = cv2.morphologyEx(page, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    return _mask_to_quads(page, img_shape, 0.08)
+
+
+def find_document_contour(image, min_area_ratio=0.08):
+    """Находит четырёхугольник листа. Возвращает (quad, метод) или (None, причина).
+
+    Главный путь — квад из МАСКИ листа (геодезическая реконструкция по
+    цвету): она находит границу листа даже на светлом столе. Масковый квад
+    проверяется выпрямлением и принимается сразу. Прочие кандидаты
+    (заливка фона, яркостные маски, рёбра) — запасные, с высокой планкой
+    оценки: ошибка перспективы хуже её отсутствия.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    eq = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(blur)
+    h, w = gray.shape
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    hsv = cv2.cvtColor(cv2.GaussianBlur(image, (7, 7), 0), cv2.COLOR_BGR2HSV)
+    sat, val = hsv[:, :, 1], hsv[:, :, 2]
 
-    _, thr = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    quad = _quads_from_mask(thr, image.shape, min_area_ratio)
-    if quad is not None:
-        return None if _near_frame(quad, image.shape) else quad
+    m, frac = page_mask(image)
+    if m is not None and frac > 0.985:
+        return None, "лист занимает весь кадр"
 
-    edged = cv2.Canny(eq, 60, 160)
-    edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=2)
-    edged = cv2.erode(edged, np.ones((3, 3), np.uint8), iterations=1)
-    quad = _quads_from_mask(edged, image.shape, min_area_ratio)
-    if quad is not None:
-        return None if _near_frame(quad, image.shape) else quad
+    # --- главный путь: квад из маски листа ---
+    if m is not None and frac >= 0.20:
+        mask_quads = _mask_to_quads(m, image.shape, min_area_ratio, max_quads=2)
+        if mask_quads:
+            q = max(mask_quads, key=lambda qq: cv2.contourArea(qq.astype(np.int32)))
+            if _warp_verify(image, q):
+                return q, "маска листа (доля %.2f)" % frac
 
-    bs = int(max(15, min(51, min(image.shape[:2]) // 20)))
-    if bs % 2 == 0:
-        bs += 1
-    adap = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                 cv2.THRESH_BINARY, bs, 10)
-    adap = cv2.morphologyEx(adap, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
-    quad = _quads_from_mask(adap, image.shape, min_area_ratio)
-    if quad is not None:
-        return None if _near_frame(quad, image.shape) else quad
+    candidates = []
+    methods = []
+    if m is not None:
+        qs = _mask_to_quads(m, image.shape, min_area_ratio)
+        candidates += qs
+        methods += ["маска"] * len(qs)
 
-    thr_inv = cv2.morphologyEx(cv2.bitwise_not(thr), cv2.MORPH_CLOSE,
-                               np.ones((9, 9), np.uint8))
-    quad = _quads_from_mask(thr_inv, image.shape, min_area_ratio)
-    if quad is not None:
-        return None if _near_frame(quad, image.shape) else quad
+    candidates += _bg_complement_quads(image, image.shape)
+    methods += ["заливка фона"] * 10
 
-    quad = _quad_from_hough_lines(image)
-    if quad is not None and not _near_frame(quad, image.shape):
-        return quad
+    gray_norm = _flat_field(gray)
 
-    quad = _quad_from_hull(thr, image.shape)
-    if quad is not None and not _near_frame(quad, image.shape):
-        return quad
-    return None
+    # маски яркости/насыщенности (светлый лист на тёмном или цветном фоне)
+    otsu_t, bw_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    v_lo = max(60, int(otsu_t * 0.55))
+    bw_shadowfree = ((sat < 70) & (val > v_lo)).astype(np.uint8) * 255
+    bw_dark = cv2.bitwise_not(bw_otsu)
+    for mask in (bw_otsu, bw_shadowfree, bw_dark):
+        cover = float((mask > 0).mean())
+        if cover < 0.10 or cover > 0.88:
+            continue  # маска ни о чём: почти всё или почти ничего
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+        qs = _mask_to_quads(mask, image.shape, min_area_ratio)
+        candidates += qs
+        methods += ["яркость"] * len(qs)
 
+    # рёбра Canny
+    qs = _edge_quads(gray_norm, image.shape, min_area_ratio)
+    candidates += qs
+    methods += ["рёбра"] * len(qs)
 
-# ----------------------------------------------------------------------------
-# Текстовая маска и проекционные методы выравнивания (v2)
-# ----------------------------------------------------------------------------
+    if not candidates:
+        return None, "контур не найден"
 
-def _text_mask(gray, max_side=1000):
-    """Бинарная маска текста/линий (белым) в уменьшенном масштабе.
+    # карта похожести на лист: внутри квада — лист, снаружи — стол
+    dist_img, _ = _page_distance(image)
+    scored = []
+    for i, quad in enumerate(candidates):
+        sc = _quad_score(dist_img, quad, image.shape)
+        if sc > -1e8:
+            scored.append((sc, float(cv2.contourArea(quad.astype(np.int32))), i))
+    if not scored:
+        return None, "надёжный контур не найден"
+    best_sc = max(s[0] for s in scored)
+    if best_sc < 4.2:
+        # слабые кандидаты не принимаем: ошибка перспективы хуже её отсутствия
+        return None, "надёжный контур не найден (оценка %.2f)" % best_sc
 
-    Адаптивный порог ловит и тёмный текст на светлом, и светлый мел
-    на тёмном. Возвращает (маска, уменьшенный серый, масштаб).
-    """
-    h, w = gray.shape[:2]
-    scale = min(1.0, float(max_side) / max(h, w))
-    if scale < 1.0:
-        g = cv2.resize(gray, (int(round(w * scale)), int(round(h * scale))),
-                       interpolation=cv2.INTER_AREA)
-    else:
-        g = gray
-    hh, ww = g.shape[:2]
-    bs = int(np.clip(round(min(hh, ww) / 22.0), 15, 51))
-    if bs % 2 == 0:
-        bs += 1
-    c = max(10, bs // 3)
-
-    def clean(bw):
-        bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(bw, 8)
-        if n > 1:
-            # убираем пыль и «гигантов»: рёбра страницы, клинья поворота,
-            # границы стола — они не текст и ломают измерение углов
-            big = (stats[1:, cv2.CC_STAT_WIDTH] > 0.55 * ww) | \
-                  (stats[1:, cv2.CC_STAT_HEIGHT] > 0.55 * hh)
-            keep = np.zeros(n, bool)
-            keep[1:] = (stats[1:, cv2.CC_STAT_AREA] >= 8) & \
-                       (stats[1:, cv2.CC_STAT_WIDTH] >= 3) & \
-                       (stats[1:, cv2.CC_STAT_HEIGHT] >= 3) & ~big
-            bw = bw * keep[lab].astype(np.uint8)
-        return bw
-
-    inv = clean(cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                      cv2.THRESH_BINARY_INV, bs, c))
-    pos = clean(cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                      cv2.THRESH_BINARY, bs, c))
-
-    def frac_ok(m):
-        f = float((m > 0).mean())
-        return 0.004 <= f <= 0.32
-
-    if frac_ok(inv) and not frac_ok(pos):
-        mask = inv
-    elif frac_ok(pos) and not frac_ok(inv):
-        mask = pos
-    elif frac_ok(inv) and frac_ok(pos):
-        mask = inv if (inv > 0).mean() >= (pos > 0).mean() else pos
-    else:
-        # обе полярности «мимо» — берём ту, что ближе к разумной плотности
-        di = abs(float((inv > 0).mean()) - 0.05)
-        dp = abs(float((pos > 0).mean()) - 0.05)
-        mask = inv if di <= dp else pos
-    return mask, g, scale
+    # среди почти таких же по оценке — самый большой квад, затем проверка
+    top = sorted([s for s in scored if s[0] >= best_sc - 0.55], key=lambda s: -s[1])
+    for sc, area, i in top[:4]:
+        if m is not None and area < (frac - 0.12) * h * w:
+            continue  # квад меньше известной маски листа — врезка
+        if _warp_verify(image, candidates[i]):
+            return candidates[i], "кандидат %d (метод: %s, оценка %.2f)" % (
+                i + 1, methods[i] if i < len(methods) else "?", sc)
+    return None, "кандидаты не прошли проверку выпрямлением"
 
 
-def _rot_score(mask, angle):
-    """Дисперсионная оценка «горизонтальности» маски при повороте на angle."""
-    h, w = mask.shape
-    m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
-    rot = cv2.warpAffine(mask, m, (w, h), flags=cv2.INTER_NEAREST,
-                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    rs = rot.sum(axis=1).astype(np.float64)
-    if rs.size < 8:
-        return 0.0
-    d = rs[1:] - rs[:-1]
-    return float(np.dot(d, d))
-
-
-def _projection_angle(mask, max_angle=12.0, coarse=0.25, fine=0.05):
-    """Угол наклона строк текста проекционным методом. Возвращает (угол, уверенность)."""
-    if (mask > 0).mean() < 0.002:
-        return 0.0, 0.0
-    angs = np.arange(-max_angle, max_angle + 1e-9, coarse)
-    scores = np.array([_rot_score(mask, float(a)) for a in angs])
-    i = int(np.argmax(scores))
-    best = float(angs[i])
-    lo, hi = best - coarse, best + coarse
-    angs2 = np.arange(lo, hi + 1e-9, fine)
-    scores2 = np.array([_rot_score(mask, float(a)) for a in angs2])
-    j = int(np.argmax(scores2))
-    angle = float(angs2[j])
-    base = float(np.median(scores))
-    spread = float(np.std(scores) + 1e-9)
-    conf = (float(scores2[j]) - base) / spread
-    return angle, conf
-
-
-def _hough_median_angle(image, max_angle=20.0):
-    """Страховка: медианный угол длинных линий Хафа (старый метод)."""
+def _edge_content_frac(image, inset=0.004, band=0.018, dark=130):
+    """Доля тёмных пикселей (текста) в кромочных полосах каждой стороны."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    bi, bb = max(2, int(h * band)), max(2, int(w * band))
+    yi0, yi1 = int(h * inset), int(h * inset) + bb
+    xi0, xi1 = int(w * inset), int(w * inset) + bb
+    bands = {
+        'top': gray[yi0:yi1, int(w * 0.2):int(w * 0.8)],
+        'bottom': gray[h - yi1:h - yi0 or h, int(w * 0.2):int(w * 0.8)],
+        'left': gray[int(h * 0.2):int(h * 0.8), xi0:xi1],
+        'right': gray[int(h * 0.2):int(h * 0.8), w - xi1:w - xi0 or w],
+    }
+    out = {}
+    for k, v in bands.items():
+        out[k] = float((v < dark).mean()) if v.size else 0.0
+    return out
+
+
+def crop_by_mask(image, min_frac=0.20, max_frac=0.975, axis_only=False):
+    """Кроп «только лист» по маске: повернутый прямоугольник маски -> рамка.
+
+    Гарантирует, что в кадре остаётся только лист, даже если перспективу
+    найти не удалось: маска листа строится по цвету (геодезически),
+    вписанный прямоугольник выпрямляет и обрезает одним махом. Если у
+    кромки результата обнаружен текст (маска села близко к контенту),
+    рамка расширяется — контент важнее чистоты кромки.
+    axis_only=True — резать БЕЗ поворота (осевой габарит): для контрольного
+    прохода ПОСЛЕ выравнивания, когда любой «угол» прямоугольника — шум
+    маски, а не реальный наклон.
+    Возвращает (изображение, применено ли, доля маски).
+    """
+    h, w = image.shape[:2]
+    m, frac = page_mask(image)
+    if m is None or not (min_frac <= frac <= max_frac):
+        return image, False, frac
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return image, False, frac
+    c = max(cnts, key=cv2.contourArea)
+    hull = cv2.convexHull(c)
+    quad = None
+    peri = cv2.arcLength(hull, True)
+    for eps_rel in (0.02, 0.04, 0.07):
+        approx = cv2.approxPolyDP(hull, eps_rel * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quad = approx.reshape(4, 2).astype("float32")
+            break
+    if quad is None:
+        quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
+
+    if axis_only:
+        # осевой габарит маски — без какого-либо поворота
+        x0, y0, ww, hh = cv2.boundingRect(hull)
+        out = None
+        for margin in (0.006, 0.016):
+            mx = max(4, int(margin * w))
+            my = max(4, int(margin * h))
+            xa = max(0, x0 - mx)
+            ya = max(0, y0 - my)
+            xb = min(w, x0 + ww + mx)
+            yb = min(h, y0 + hh + my)
+            cand = image[ya:yb, xa:xb].copy()
+            if cand.shape[0] < 0.3 * h or cand.shape[1] < 0.3 * w:
+                break
+            out = cand
+            edges = _edge_content_frac(cand)
+            if max(edges.values()) <= 0.025:
+                break
+        if out is not None:
+            return out, True, frac
+        return image, False, frac
+
+    out = None
+    for margin in (0.006, 0.016):
+        q = _expand_quad(quad, margin)
+        cand = four_point_transform(image, q)
+        # защита от вырождения и разворотов на 90°
+        if cand.shape[0] < 0.3 * h or cand.shape[1] < 0.3 * w:
+            break
+        if cand.shape[0] * cand.shape[1] > 1.6 * h * w:
+            break
+        out = cand
+        # у кромки явно есть текст? — чуть расширяем рамку (контент важнее)
+        edges = _edge_content_frac(cand)
+        if max(edges.values()) <= 0.025:
+            break
+    if out is None:
+        return image, False, frac
+    return out, True, frac
+
+
+# ----------------------------------------------------------------------------
+# Автоопределение и исправление наклона
+# ----------------------------------------------------------------------------
+
+def _hough_skew(gray, max_angle=12.0):
+    """Угол по линиям (Хаф). Быстро, но знак иногда ошибается — только подстраховка."""
     edges = cv2.Canny(gray, 50, 150)
     h, w = edges.shape
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0,
-                            threshold=max(60, w // 15),
-                            minLineLength=max(40, w // 10), maxLineGap=20)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180.0,
+        threshold=max(60, w // 15),
+        minLineLength=max(40, w // 10),
+        maxLineGap=20,
+    )
     if lines is None or len(lines) < 4:
-        return 0.0, 0.0
+        return None
     angles = []
     for x1, y1, x2, y2 in lines[:, 0, :]:
         a = np.degrees(np.arctan2(float(y2 - y1), float(x2 - x1)))
@@ -379,86 +755,90 @@ def _hough_median_angle(image, max_angle=20.0):
         if abs(a) <= max_angle:
             angles.append(a)
     if len(angles) < 4:
-        return 0.0, 0.0
-    return float(np.median(angles)), min(1.0, len(angles) / 20.0)
+        return None
+    return float(np.median(angles))
 
 
-def _hv_energy(mask):
-    """Энергии горизонтальной (H) и вертикальной (V) линейной структуры маски."""
-    rs = mask.sum(axis=1).astype(np.float64)
-    cs = mask.sum(axis=0).astype(np.float64)
-    h = float(np.var(rs) / (np.mean(rs) ** 2 + 1e-9))
-    v = float(np.var(cs) / (np.mean(cs) ** 2 + 1e-9))
-    return h, v
+def _rotate_mask(sub, angle):
+    """Поворот маски на малый угол вокруг центра (для скана углов)."""
+    h, w = sub.shape
+    m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    return cv2.warpAffine(sub, m, (w, h), flags=cv2.INTER_NEAREST,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
-def _text_asymmetry(mask):
-    """Медианный сдвиг центра масс строки от центра её полосы.
+def _projection_skew(gray, max_angle=12.0):
+    """Угол по проекционным профилям строк текста: знак надёжный.
 
-    У нормального (не перевёрнутого) текста центр масс чуть ниже середины
-    полосы (строчные буквы + нижние выносные) — знак подсказывает, не
-    перевёрнут ли текст на 180 град. Возвращает (асимметрия, число полос).
+    Текст бинаризуем адаптивным порогом (не боится теней), поворачиваем маску
+    на пробные углы и ищем максимум дисперсии суммы по строкам: строки текста
+    дают резкие пики, когда текст горизонтален.
     """
-    rs = mask.sum(axis=1).astype(np.float64)
-    if rs.sum() < 500:
-        return 0.0, 0
-    rs = np.convolve(rs, np.ones(5) / 5.0, mode="same")
-    thr = 0.35 * float(rs.max())
-    on = rs > thr
-    offs = []
-    y, n_total = 0, len(rs)
-    while y < n_total:
-        if on[y]:
-            y0 = y
-            while y < n_total and on[y]:
-                y += 1
-            if y - y0 >= 6:
-                seg = rs[y0:y]
-                wsum = seg.sum()
-                if wsum > 0:
-                    c = float((np.arange(y0, y) * seg).sum() / wsum)
-                    offs.append(c - (y0 + y - 1) / 2.0)
-        else:
-            y += 1
-    if not offs:
-        return 0.0, 0
-    return float(np.median(offs)), len(offs)
+    h, w = gray.shape
+    scale = max(1, max(h, w) // 900)
+    small = gray[::scale, ::scale]
+    mask = cv2.adaptiveThreshold(
+        small, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 12)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    frac = float((mask > 0).mean())
+    if frac < 0.004 or frac > 0.45:
+        return None
+    ys, xs = np.where(mask > 0)
+    y0, y1 = max(0, ys.min() - 12), min(small.shape[0], ys.max() + 13)
+    x0, x1 = max(0, xs.min() - 12), min(small.shape[1], xs.max() + 13)
+    sub = mask[y0:y1, x0:x1]
+    if sub.shape[0] < 60 or sub.shape[1] < 60:
+        return None
+
+    def score_angle(a):
+        m = _rotate_mask(sub, a).astype(np.float32)
+        rows = m.sum(axis=1)
+        return float(((rows - rows.mean()) ** 2).sum())
+
+    # грубый скан, затем уточнение
+    angles = np.arange(-max_angle, max_angle + 1e-6, 0.5)
+    scores = [score_angle(a) for a in angles]
+    i = int(np.argmax(scores))
+    a0 = angles[i]
+    fine = np.arange(a0 - 0.45, a0 + 0.45 + 1e-6, 0.1)
+    fs = [score_angle(a) for a in fine]
+    best = fine[int(np.argmax(fs))]
+
+    # если даже лучший профиль слабый (текста мало) — не доверяем:
+    # остаточный наклон в 1–2° лучше, чем поворот на неверный угол
+    m = _rotate_mask(sub, best).astype(np.float32)
+    rows = m.sum(axis=1)
+    sharp = float(rows.std() / max(rows.mean(), 1.0))
+    if sharp < 0.55:
+        return None
+    # большие углы — только при очень уверенном пике (защита от ложных
+    # срабатываний на мелких кропах и рисунках)
+    if abs(best) > 8.0 and sharp < 0.80:
+        return None
+    return float(best)
 
 
-def _orient_upright(image):
-    """Поворачивает кадр, если он снят боком (текст вертикально).
+def detect_skew_angle(image, max_angle=12.0):
+    """Итоговый угол наклона: проекции строк (надёжный знак) + Хаф (подстраховка).
 
-    Признак «боком»: вертикальная линейная структура сильнее горизонтальной
-    (V/H >= 2). Направление поворота выбирается по асимметрии профиля строк
-    (не вверх ногами). Возвращает (изображение, повёрнут ли).
+    Хафу доверяем только на малых углах (до 3°): у Хафа на перспективно
+    искажённом тексте знак иногда ошибается, а на малом угле ошибка мала.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    mask, _, _ = _text_mask(gray)
-    h, v = _hv_energy(mask)
-    if v < 2.0 * max(h, 1e-9):
-        return image, False
-    # снят боком: выбрать направление по асимметрии текста
-    m_cw = np.rot90(mask, -1)    # CW: так выглядит маска после поворота кадра CW
-    m_ccw = np.rot90(mask, 1)    # CCW
-    a_cw, n_cw = _text_asymmetry(m_cw)
-    a_ccw, n_ccw = _text_asymmetry(m_ccw)
-    code = cv2.ROTATE_90_CLOCKWISE
-    if n_ccw >= 8 and n_cw >= 8 and (a_ccw - a_cw) >= 0.015:
-        code = cv2.ROTATE_90_COUNTERCLOCKWISE
-    return cv2.rotate(image, code), True
-
-
-def detect_skew_angle(image, max_angle=15.0):
-    """Определяет наклон: проекционный метод по строкам, страховка — Хаф."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    mask, _, _ = _text_mask(gray)
-    ang, conf = _projection_angle(mask, max_angle=max_angle)
-    if conf < 2.0:
-        ang2, conf2 = _hough_median_angle(image, max_angle=max_angle)
-        if conf2 > 0.2:
-            return ang2
+    a_proj = _projection_skew(gray, max_angle)
+    a_hough = _hough_skew(gray, max_angle)
+    if a_proj is None and a_hough is None:
         return 0.0
-    return ang
+    if a_proj is None:
+        # без проекций поворачиваем только чуть-чуть и только по Хафу
+        if abs(a_hough) <= 3.0:
+            return a_hough
+        return 0.0
+    if a_hough is None:
+        return a_proj
+    if abs(a_hough - a_proj) <= 1.0:
+        return 0.5 * (a_hough + a_proj)
+    return a_proj  # разошлись — верим проекциям: знак проверен профилями
 
 
 def rotate_bound(image, angle, bg=(255, 255, 255)):
@@ -481,337 +861,92 @@ def rotate_bound(image, angle, bg=(255, 255, 255)):
 
 
 # ----------------------------------------------------------------------------
-# Построчное выпрямление (dewarp): локальный наклон строк по полосам
+# Обрезка «только лист»: по профилям яркости
 # ----------------------------------------------------------------------------
 
-def _shear_score(band, s):
-    """Оценка «горизонтальности» полосы при вертикальном сдвиге s (тангенс).
+def _side_cut(frac_line, page_level, K):
+    """Ищет индекс, начиная с которого линия «страничная».
 
-    Сдвиг (shear) в отличие от поворота не выносит контент за пределы
-    узкой полосы, поэтому годится для локального измерения наклона.
+    frac_line[i] — доля «страничных» пикселей в строке/столбце i.
+    Возвращаем первый индекс, откуда начинается устойчиво страничный
+    участок (окно длины K подряд >= page_level).
     """
-    h, w = band.shape
-    m = np.float32([[1.0, 0.0, 0.0], [s, 1.0, 0.0]])
-    out = cv2.warpAffine(band, m, (w, h), flags=cv2.INTER_NEAREST,
-                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    rs = out.sum(axis=1).astype(np.float64)
-    if rs.size < 8:
-        return 0.0
-    d = rs[1:] - rs[:-1]
-    return float(np.dot(d, d))
+    n = len(frac_line)
+    if n < 2 * K:
+        return 0
+    f = np.asarray(frac_line, dtype=np.float32)
+    # интегральное окно
+    csum = np.concatenate([[0.0], np.cumsum(f)])
+    win = (csum[K:] - csum[:-K]) / float(K)  # win[i] = среднее по [i, i+K)
+    good = win >= page_level
+    if not good.any():
+        return 0
+    i = int(np.argmax(good))
+    return min(i, n - K)
 
 
-def _band_angles(mask, n_bands=14, max_angle=6.0):
-    """Локальный угол строк в вертикальных полосах (метод сдвига). [(x01, угол, вес), ...]"""
-    h, w = mask.shape
-    bw = max(24, int(round(w / max(4, n_bands))))
-    step = max(8, int(round(bw * 0.5)))
-    out = []
-    for x0 in range(0, max(1, w - bw + 1), step):
-        band = mask[:, x0:x0 + bw]
-        cov = float((band > 0).mean())
-        if cov < 0.006:
-            continue
-        coarse = np.arange(-max_angle, max_angle + 1e-9, 0.25)
-        scores = np.array([_shear_score(band, float(np.tan(np.radians(a))))
-                           for a in coarse])
-        i = int(np.argmax(scores))
-        best = float(coarse[i])
-        fine = np.arange(best - 0.25, best + 0.25 + 1e-9, 0.05)
-        scores2 = np.array([_shear_score(band, float(np.tan(np.radians(a))))
-                            for a in fine])
-        j = int(np.argmax(scores2))
-        # знак: сдвиг s* = -tan(наклона), т.к. warpAffine инвертирует матрицу
-        angle = -float(fine[j])
-        base = float(np.median(scores))
-        spread = float(np.std(scores) + 1e-9)
-        conf = (float(scores2[j]) - base) / spread
-        if conf < 1.5:
-            continue
-        weight = conf * min(1.0, cov / 0.04)
-        out.append(((x0 + bw / 2.0) / float(w), angle, weight))
-    return out
+def profile_crop(image, max_side_cut=0.48):
+    """Обрезает ФОН вокруг листа: в кадре остаётся только лист.
 
-
-def _strip_angles(mask, n_strips=14, max_angle=6.0):
-    """Локальный угол строк в горизонтальных полосах (по высоте).
-
-    Ловит трапецию/перспективу: наклон строк меняется от строки к строке
-    (верх страницы наклонён в одну сторону, низ — в другую).
+    Работает по профилям карты «похоже на лист» (цвет листа vs стол):
+    ряд/столбец считается «листом», если достаточная доля его пикселей
+    похожа на лист. Чужие ряды (стол, ткань) отрезаются. Контент потерять
+    нельзя: строка с текстом всё равно в основном цвета листа.
+    Возвращает (изображение, словарь с размеров срезов).
     """
-    h, w = mask.shape
-    sh = max(20, int(round(h / max(4, n_strips))))
-    step = max(6, int(round(sh * 0.5)))
-    out = []
-    for y0 in range(0, max(1, h - sh + 1), step):
-        strip = mask[y0:y0 + sh]
-        cov = float((strip > 0).mean())
-        if cov < 0.006:
-            continue
-        coarse = np.arange(-max_angle, max_angle + 1e-9, 0.25)
-        scores = np.array([_strip_score(strip, float(np.tan(np.radians(a))))
-                           for a in coarse])
-        i = int(np.argmax(scores))
-        best = float(coarse[i])
-        fine = np.arange(best - 0.25, best + 0.25 + 1e-9, 0.05)
-        scores2 = np.array([_strip_score(strip, float(np.tan(np.radians(a))))
-                            for a in fine])
-        j = int(np.argmax(scores2))
-        angle = -float(fine[j])
-        base = float(np.median(scores))
-        spread = float(np.std(scores) + 1e-9)
-        conf = (float(scores2[j]) - base) / spread
-        if conf < 1.5:
-            continue
-        weight = conf * min(1.0, cov / 0.04)
-        out.append(((y0 + sh / 2.0) / float(h), angle, weight))
-    return out
-
-
-def _strip_score(strip, s):
-    """Сдвиговая оценка наклона строк в горизонтальной полосе (с запасом кадра)."""
-    h, w = strip.shape
-    pad = int(abs(s) * w * 0.5) + 2
-    m = np.float32([[1.0, 0.0, 0.0], [s, 1.0, float(pad)]])
-    out = cv2.warpAffine(strip, m, (w, h + 2 * pad), flags=cv2.INTER_NEAREST,
-                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    rs = out.sum(axis=1).astype(np.float64)
-    if rs.size < 8:
-        return 0.0
-    d = rs[1:] - rs[:-1]
-    return float(np.dot(d, d))
-
-
-def _build_maps(shape, ch_x=None, mv_y=None, cv_y=None):
-    """Карта ремапа из компонент выпрямления.
-
-    ch_x — сдвиг столбцов Ch(x) (изгиб страницы);
-    mv_y — строчный наклон m(y) (трапеция): map_y -= m(y)*(x - w/2);
-    cv_y — сдвиг строк Cv(y) (вертикали).
-    """
-    h, w = shape[:2]
-    map_y = np.tile(np.arange(h, dtype=np.float32).reshape(h, 1), (1, w))
-    if ch_x is not None:
-        map_y += ch_x.astype(np.float32).reshape(1, w)
-    if mv_y is not None:
-        xs = np.arange(w, dtype=np.float32) - float(w) / 2.0
-        map_y -= mv_y.astype(np.float32).reshape(h, 1) * xs.reshape(1, w)
-    map_x = np.tile(np.arange(w, dtype=np.float32).reshape(1, w), (h, 1))
-    if cv_y is not None:
-        map_x += cv_y.astype(np.float32).reshape(h, 1)
-    return map_x, map_y
-
-
-def _fit_line(points, degree=1):
-    """Робастная аппроксимация угла полос: угол = f(x). Возвращает coef или None."""
-    if len(points) < 4:
-        return None
-
-    def _fit(pts, deg):
-        x = np.array([p[0] for p in pts], np.float64)
-        y = np.array([p[1] for p in pts], np.float64)
-        w = np.array([max(0.1, p[2]) for p in pts], np.float64)
-        for _ in range(3):
-            if x.size < deg + 2:
-                return None, None
-            coef = np.polyfit(x, y, deg, w=np.sqrt(w))
-            resid = y - np.polyval(coef, x)
-            mad = float(np.median(np.abs(resid - np.median(resid)))) + 0.05
-            keep = np.abs(resid) < 3.0 * mad
-            if keep.all() or keep.sum() < deg + 2:
-                break
-            x, y, w = x[keep], y[keep], w[keep]
-        if x.size < deg + 2 or coef is None:
-            return None, None
-        resid = np.abs(y - np.polyval(coef, x))
-        return coef, float(np.median(resid))
-
-    coef1, r1 = _fit(points, 1)
-    if degree >= 2 and len(points) >= 7:
-        coef2, r2 = _fit(points, 2)
-        # квадратику берём только если она заметно лучше (не «гнётся» на выбросах)
-        if coef2 is not None and (coef1 is None or r2 < 0.7 * r1):
-            return coef2
-    return coef1
-
-
-def _displacement_from_angles(coef, n, size_px, cap_frac=0.10):
-    """Сдвиги столбцов/строк из аппроксимации углов (кумулятивная сумма тангенсов)."""
-    xs = np.linspace(0.0, 1.0, n)
-    ang = np.polyval(coef, xs)
-    s = np.tan(np.radians(ang))
-    d = np.zeros(n, np.float64)
-    d[1:] = np.cumsum((s[1:] + s[:-1]) * 0.5 / (n - 1))
-    d -= d.mean()
-    d *= float(size_px)
-    cap = cap_frac * size_px
-    return np.clip(d, -cap, cap), float(np.max(ang) - np.min(ang))
-
-
-def _apply_maps(image, ch_x=None, mv_y=None, cv_y=None):
-    """Применяет сдвиги выпрямления одним ремапом."""
-    map_x, map_y = _build_maps(image.shape[:2], ch_x, mv_y, cv_y)
-    return cv2.remap(image, map_x, map_y,
-                     interpolation=cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_CONSTANT,
-                     borderValue=(255, 255, 255) if image.ndim == 3 else 255)
-
-
-def _warp_mask(mask, ch_x=None, mv_y=None, cv_y=None, replicate=False):
-    """То же для маски/серого (для проверки результата)."""
-    map_x, map_y = _build_maps(mask.shape[:2], ch_x, mv_y, cv_y)
-    return cv2.remap(mask, map_x, map_y, interpolation=cv2.INTER_NEAREST,
-                     borderMode=cv2.BORDER_REPLICATE if replicate
-                     else cv2.BORDER_CONSTANT, borderValue=0)
-
-
-def _spread_of(mask):
-    """Разброс локальных углов строк (градусы) — мера «ровности».
-
-    Усечённый (10–90 перцентиль), чтобы мусорные крайние полосы не раздували оценку.
-    """
-    pts = _band_angles(mask)
-    if len(pts) < 3:
-        return 0.0
-    angs = np.array([p[1] for p in pts])
-    return float(np.percentile(angs, 90) - np.percentile(angs, 10))
-
-
-def _vertical_line_angle(gray):
-    """Медианный наклон длинных вертикальных линий (клетка, поля, края).
-
-    Возвращает (угол_от_вертикали_в_градусах, число_линий).
-    """
-    edges = cv2.Canny(gray, 50, 150)
-    h, w = edges.shape
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0,
-                            threshold=max(50, h // 20),
-                            minLineLength=max(60, h // 6), maxLineGap=25)
-    if lines is None:
-        return 0.0, 0
-    angs = []
-    for x1, y1, x2, y2 in lines[:, 0, :]:
-        dx, dy = float(x2 - x1), float(y2 - y1)
-        if dy < 0.0:
-            dx, dy = -dx, -dy
-        if abs(dy) <= abs(dx):
-            continue
-        a = float(np.degrees(np.arctan2(dx, dy)))
-        if abs(a) <= 10.0:
-            angs.append(a)
-    if len(angs) < 4:
-        return 0.0, len(angs)
-    return float(np.median(angs)), len(angs)
-
-
-def dewarp_lines(image, gray=None):
-    """Построчное выпрямление: трапеция, изгиб страницы, вертикали.
-
-    Две независимые компоненты наклона строк:
-    - изгиб страницы: наклон меняется вдоль СТРОКИ -> сдвиги столбцов Ch(x);
-    - трапеция/перспектива: наклон меняется от строки к строке ->
-      строчная компонента m(y): map_y -= m(y)*(x - w/2).
-    Вертикали: медианный наклон длинных вертикальных линий (Хаф)
-    компенсируется линейным сдвигом строк Cv(y).
-
-    Возвращает (изображение, отчёт dict). Если выправлять нечего —
-    изображение без изменений.
-    """
-    if gray is None:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    mask, gsmall, scale = _text_mask(gray)
     h, w = image.shape[:2]
-    mh, mw = mask.shape
-    report = {"applied": False, "h": False, "v": False, "trap": False,
-              "spread_before": 0.0, "spread_after": 0.0, "v_angle": 0.0}
+    info_cuts = {"top": 0, "bottom": 0, "left": 0, "right": 0}
+    if h < 240 or w < 240:
+        return image, info_cuts
 
-    def _full_ch(ch_small):
-        ch = np.interp(np.arange(w, dtype=np.float64),
-                       np.linspace(0, w - 1, len(ch_small)), ch_small)
-        return np.clip(ch * (float(h) / mh), -0.10 * h, 0.10 * h)
+    dist, ref = _page_distance(image)
 
-    for _it in range(2):
-        # --- изгиб: полосы по x -> Ch(x) ---
-        ch_small = None
-        pts = _band_angles(mask)
-        deg = 2 if len(pts) >= 7 else 1
-        coef = _fit_line(pts, degree=deg)
-        if coef is not None:
-            d_small, spread = _displacement_from_angles(coef, mw, mh, 0.10)
-            if spread >= 0.5 or abs(float(np.polyval(coef, 0.5))) >= 0.5:
-                ch_small = d_small
-                if report["spread_before"] == 0.0:
-                    report["spread_before"] = round(spread, 2)
+    # адаптивный порог «лист/стол» и уровень активации обрезки
+    center, border, t_split = _dist_stats(dist)
+    if center - border < 8.0:
+        # контраста «лист-фон» нет: лист занимает весь кадр
+        return image, info_cuts
 
-        # --- трапеция: полосы по y -> m(y) ---
-        mv_small = None
-        pts_y = _strip_angles(mask)
-        deg_y = 2 if len(pts_y) >= 7 else 1
-        coef_y = _fit_line(pts_y, degree=deg_y)
-        if coef_y is not None:
-            ys01 = np.linspace(0.0, 1.0, mh)
-            ang_y = np.polyval(coef_y, ys01)
-            if float(np.max(ang_y) - np.min(ang_y)) >= 0.5 or \
-                    abs(float(np.polyval(coef_y, 0.5))) >= 0.5:
-                mv_small = np.tan(np.radians(ang_y))
-                mv_small = np.clip(mv_small, -0.12, 0.12)
+    pageish = (dist > t_split - 6.0).astype(np.float32)
+    level = 0.58
 
-        if ch_small is None and mv_small is None:
-            break
+    Kh = max(6, int(round(h * 0.025)))
+    Kw = max(6, int(round(w * 0.025)))
+    rows = pageish.mean(axis=1)
+    cols = pageish.mean(axis=0)
 
-        # --- проверка на маске: разброс углов не должен ухудшиться ---
-        before = _spread_of(mask)
-        after = _spread_of(_warp_mask(mask, ch_x=ch_small, mv_y=mv_small))
-        if after > before + 0.25:
-            # пробуем компоненты по отдельности
-            after_ch = _spread_of(_warp_mask(mask, ch_x=ch_small)) \
-                if ch_small is not None else before
-            after_mv = _spread_of(_warp_mask(mask, mv_y=mv_small)) \
-                if mv_small is not None else before
-            if min(after_ch, after_mv) <= before + 0.25:
-                if after_ch <= after_mv:
-                    mv_small, after = None, after_ch
-                else:
-                    ch_small, after = None, after_mv
-            else:
-                break
+    lim_h = int(h * max_side_cut)
+    lim_w = int(w * max_side_cut)
 
-        ch_full = _full_ch(ch_small) if ch_small is not None else None
-        mv_full = None
-        if mv_small is not None:
-            mv_full = np.interp(np.arange(h, dtype=np.float64),
-                                np.linspace(0, h - 1, len(mv_small)), mv_small)
-            mv_full = np.clip(mv_full, -0.12, 0.12)
-        image = _apply_maps(image, ch_x=ch_full, mv_y=mv_full)
-        mask = _warp_mask(mask, ch_x=ch_small, mv_y=mv_small)
-        report["h"] = report["h"] or ch_small is not None
-        report["trap"] = report["trap"] or mv_small is not None
-        report["spread_after"] = round(after, 2)
-        if after < 0.8:
-            break
+    top = _side_cut(rows, level, Kh)
+    bottom = h - _side_cut(rows[::-1], level, Kh)
+    left = _side_cut(cols, level, Kw)
+    right = w - _side_cut(cols[::-1], level, Kw)
 
-    # --- вертикали: линейный сдвиг строк Cv(y) по медиане Хафа ---
-    cv_small = None
-    av, cnt = _vertical_line_angle(gsmall)
-    report["v_angle"] = round(av, 2)
-    if cnt >= 4 and 0.4 <= abs(av) <= 8.0:
-        t = float(np.tan(np.radians(av)))
-        ys = np.arange(mh, dtype=np.float64)
-        cand = t * (ys - mh / 2.0)
-        if float(np.abs(cand).max()) <= 0.06 * mw:
-            g2 = _warp_mask(gsmall, cv_y=cand.astype(np.float32), replicate=True)
-            av2, _ = _vertical_line_angle(g2)
-            if abs(av2) <= abs(av) + 0.25:
-                cv_small = cand
-                report["v"] = True
-                cv_full = np.interp(np.arange(h, dtype=np.float64),
-                                    np.linspace(0, h - 1, len(cv_small)),
-                                    cv_small) * (float(w) / mw)
-                cv_full = np.clip(cv_full, -0.06 * w, 0.06 * w)
-                image = _apply_maps(image, cv_y=cv_full)
+    top = min(top, lim_h)
+    bottom = max(bottom, h - lim_h)
+    left = min(left, lim_w)
+    right = max(right, w - lim_w)
 
-    report["applied"] = report["h"] or report["v"] or report["trap"]
-    return image, report
+    # совсем мелкую обрезку не делаем (шум профилей)
+    if top < h * 0.01:
+        top = 0
+    if h - bottom < h * 0.01:
+        bottom = h
+    if left < w * 0.01:
+        left = 0
+    if w - right < w * 0.01:
+        right = w
+
+    if top == 0 and bottom == h and left == 0 and right == w:
+        return image, info_cuts
+    if bottom - top < h * 0.30 or right - left < w * 0.30:
+        # подозрительно много — лучше не трогать (защита от ошибки)
+        return image, info_cuts
+
+    info_cuts = {"top": int(top), "bottom": int(h - bottom),
+                 "left": int(left), "right": int(w - right)}
+    return image[top:bottom, left:right].copy(), info_cuts
 
 
 # ----------------------------------------------------------------------------
@@ -826,117 +961,128 @@ def denoise(image, h=4.0):
     return image, False
 
 
-def balance_light(image, clahe_clip=2.0):
-    """Выравнивает освещённость и делает фон ОДНОТОННЫМ (flat-field).
+def balance_light(image, clahe_clip=1.35):
+    """Тени/виньетка убираются, фон страницы приводится к однотонному белому.
 
-    Яркость делится на сглаженную оценку фона — уходят виньетка, тени,
-    разводы, градиенты. Для «белых листов» (медиана тона высокая) фон
-    подтягивается к белому (цель 252) + мягкий CLAHE для контраста текста.
-    Для досок и тёмной бумаги тон сохраняется и только выравнивается
-    (мягкое усиление, без CLAHE — он раздувает шум до белёсых разводов).
+    1) flat-field по L-каналу (ядро мельче — ловит и средние тени): делим
+       яркость на гладкую оценку фона — пропадают тени, разводы, виньетка;
+    2) мягкий CLAHE — контраст текста;
+    3) двухступенчатое мягкое «отбеливание»: всё, что светлее ~196, плавно
+       тянется к белому, светлее ~234 — становится чистым белым. Фон
+       страницы получается однотонным, текст и карандаш не затрагиваются.
     """
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    h, w = l.shape
-    # класс кадра: «белый лист» (медиана тона высокая) или доска/тёмная бумага.
-    # Медиана устойчивее доли ярких пикселей: фото доски со светлой стеной
-    # не должно пытаться выбелиться до 252
-    med = float(np.median(l))
-    p90 = float(np.percentile(l, 90))
-    white_page = med >= 170.0 or p90 >= 240.0
-    if white_page:
-        k = int(np.clip(min(h, w) / 18.0, 21, 101))
-    else:
-        # доска/тёмная бумага: ядро больше, чтобы широкие рисунки мелом
-        # не давали ореолов
-        k = int(np.clip(min(h, w) / 10.0, 31, 151))
-    if k % 2 == 0:
-        k += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    bg = cv2.morphologyEx(l, cv2.MORPH_CLOSE, kernel)
-    bg = cv2.GaussianBlur(bg, (0, 0), k / 3.0, borderType=cv2.BORDER_REPLICATE)
-    bgf = np.maximum(bg.astype(np.float32), 30.0)
-    if white_page:
-        gain = np.clip(252.0 / bgf, 0.55, 2.0)
-    else:
-        # тон сохраняем, только выравниваем: без выбеливания и без CLAHE
-        # (CLAHE на тёмных тайлах раздувает шум до белёсых разводов)
-        target = float(np.clip(np.percentile(bg, 55), 50.0, 190.0))
-        gain = np.clip(target / bgf, 0.75, 1.30)
-    l = np.clip(l.astype(np.float32) * gain, 0, 255).astype(np.uint8)
-    if white_page:
-        clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-        l = clahe.apply(l)
+    l = _flat_field(l, target=252.0, kfrac=0.08)
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+
+    lf = l.astype(np.float32)
+    t1 = np.clip((lf - 196.0) / 50.0, 0.0, 1.0)   # 196 -> 0, 246 -> 1
+    lf = lf * (1.0 - t1) + 255.0 * t1
+    t2 = np.clip((lf - 232.0) / 12.0, 0.0, 1.0)   # финальный чистый белый
+    l = np.round(lf * (1.0 - t2) + 255.0 * t2).astype(np.uint8)
+
+    near_white = l >= 240
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    a[near_white] = 128.0 + (a[near_white] - 128.0) * 0.25
+    b[near_white] = 128.0 + (b[near_white] - 128.0) * 0.25
+    a = np.clip(a, 0, 255).astype(np.uint8)
+    b = np.clip(b, 0, 255).astype(np.uint8)
     return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
 
 
-def trim_white_margins(image, thresh=244, pad=14, min_keep=0.50):
-    """Обрезает белые поля и клинья, оставшиеся после поворота."""
-    if image.ndim == 2:
-        gray = image
-    else:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    content = gray < thresh
-    frac = float(content.mean())
-    if frac < 0.02 or frac > 0.98:
-        return image
-    ys, xs = np.where(content)
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    x0 = max(0, x0 - pad)
-    y0 = max(0, y0 - pad)
-    x1 = min(image.shape[1], x1 + pad)
-    y1 = min(image.shape[0], y1 + pad)
-    if (x1 - x0) * (y1 - y0) < min_keep * image.shape[0] * image.shape[1]:
-        return image  # обрезали бы слишком много — не трогаем
-    if x1 - x0 < 100 or y1 - y0 < 100:
-        return image
-    return image[y0:y1, x0:x1]
+def whiten_background(image, tolerance=50, grad_tolerance=8):
+    """Заливает белым фоновые области, соединённые с краями кадра.
 
-
-def whiten_background(image, tolerance=50):
-    """Заливает белым фоновые области, соединённые с краями кадра."""
+    Две заливки: с фиксированным диапазоном (грубо, широким допуском) и
+    «плавающим» диапазоном с малым допуском — она спускается по плавным
+    градиентам тени у края листа и добивает их до чистого белого. Текст
+    не затрагивается: у штрихов резкие перепады, заливка останавливается.
+    """
     h, w = image.shape[:2]
     total = float(h * w)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     bright_frac = float((gray > 180).mean())
-    # для светлых кадров фону разрешено до 55% (остатки стола/клинья),
-    # но не больше: иначе заливка протекает сквозь клетку тетради на текст
-    max_area = 0.55 if bright_frac > 0.5 else 0.30
+    max_area = 0.96 if bright_frac > 0.5 else 0.30
     out = image.copy()
-    seeds = (
-        (0, 0), (w // 2, 0), (w - 1, 0),
-        (w - 1, h // 2), (w - 1, h - 1),
-        (w // 2, h - 1), (0, h - 1), (0, h // 2),
-    )
+    seeds = []
+    for k in range(5):
+        seeds.append((int(w * k / 4.0), 0))
+        seeds.append((int(w * k / 4.0), h - 1))
+    for k in range(5):
+        seeds.append((0, int(h * k / 4.0)))
+        seeds.append((w - 1, int(h * k / 4.0)))
     for seed in seeds:
-        mask = np.zeros((h + 2, w + 2), np.uint8)
-        flags = 4 | (255 << 8) | cv2.FLOODFILL_FIXED_RANGE | cv2.FLOODFILL_MASK_ONLY
-        cv2.floodFill(out, mask, seed, (255, 255, 255),
-                      loDiff=(tolerance,) * 3, upDiff=(tolerance,) * 3,
-                      flags=flags)
-        area = float((mask == 255).sum())
-        if area == 0 or area > max_area * total:
-            continue
-        sel = mask[1:-1, 1:-1] == 255
-        out[sel] = (255, 255, 255)
+        sx = min(max(seed[0], 0), w - 1)
+        sy = min(max(seed[1], 0), h - 1)
+        for fixed, tol in ((True, tolerance), (False, grad_tolerance)):
+            mask = np.zeros((h + 2, w + 2), np.uint8)
+            flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY
+            if fixed:
+                flags |= cv2.FLOODFILL_FIXED_RANGE
+            cv2.floodFill(out, mask, (sx, sy), (255, 255, 255),
+                          loDiff=(tol,) * 3, upDiff=(tol,) * 3,
+                          flags=flags)
+            area = float((mask == 255).sum())
+            if area == 0 or area > max_area * total:
+                continue
+            sel = mask[1:-1, 1:-1] == 255
+            out[sel] = (255, 255, 255)
     return out
 
 
-def sharpen(image, amount=0.6, sigma=3.0):
+def trim_white_margins(image, thresh=242, pad=10, max_cut=0.08):
+    """Обрезает только ПОЛНОСТЬЮ пустые белые кромки (клинья после поворота).
+
+    Строка/столбец отрезается, если в нём нет ни одного пикселя темнее thresh —
+    контент (текст, линии, тени) физически не может быть потерян.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    content = gray < thresh
+    if not content.any():
+        return image
+    h, w = gray.shape
+    rows = content.any(axis=1)
+    cols = content.any(axis=0)
+    if rows.all() and cols.all():
+        return image
+    top = int(np.argmax(rows)) if rows.any() else 0
+    bottom = h - int(np.argmax(rows[::-1])) if rows.any() else h
+    left = int(np.argmax(cols)) if cols.any() else 0
+    right = w - int(np.argmax(cols[::-1])) if cols.any() else w
+    # режем не более max_cut с каждой стороны и только с запасом pad:
+    # клинья после поворота маленькие, а поля страницы не трогаем
+    top_cut = min(top, int(h * max_cut))
+    bot_cut = min(h - bottom, int(h * max_cut))
+    left_cut = min(left, int(w * max_cut))
+    right_cut = min(w - right, int(w * max_cut))
+    top = max(0, top_cut - pad)
+    bottom = h - max(0, bot_cut - pad)
+    left = max(0, left_cut - pad)
+    right = w - max(0, right_cut - pad)
+    if bottom - top < 200 or right - left < 200:
+        return image
+    if (bottom - top) * (right - left) < 0.5 * h * w:
+        return image
+    return image[top:bottom, left:right]
+
+
+def sharpen(image, amount=0.6, sigma=2.6):
     """Повышение резкости (маска нерезкости)."""
     blur = cv2.GaussianBlur(image, (0, 0), sigma)
     return cv2.addWeighted(image, 1.0 + amount, blur, -amount, 0)
 
 
-def enhance_quality(image, denoise_h=4.0, clahe_clip=2.0, sharpen_amt=0.6):
+def enhance_quality(image, denoise_h=4.0, clahe_clip=1.6, sharpen_amt=0.6):
     """Полное улучшение качества одним вызовом (для совместимости)."""
     notes = []
     image, den_ok = denoise(image, denoise_h)
     notes.append("шум убран" if den_ok else "шумоподавление пропущено (большой размер)")
     image = balance_light(image, clahe_clip)
     image = sharpen(image, sharpen_amt)
-    notes.append("освещённость и контраст выровнены, резкость повышена")
+    notes.append("освещённость выровнена, фон однотонный, резкость повышена")
     return image, notes
 
 
@@ -944,105 +1090,102 @@ def enhance_quality(image, denoise_h=4.0, clahe_clip=2.0, sharpen_amt=0.6):
 # Главный конвейер
 # ----------------------------------------------------------------------------
 
-def process_image(image, do_perspective=True, do_skew=True, do_enhance=True):
-    """Обрабатывает изображение (BGR, numpy). Возвращает (результат, словарь отчёта)."""
+def process_image(image, do_perspective=True, do_skew=True, do_enhance=True,
+                  rotate_deg=0):
+    """Обрабатывает изображение (BGR, numpy). Возвращает (результат, словарь отчёта).
+
+    rotate_deg — предварительный поворот всего кадра на 90/180/270°
+    (для снимков «на боку» или «вверх ногами»): делается ДО всех
+    остальных этапов, чтобы выравнивание и поиск границ работали
+    с правильно ориентированным текстом.
+    """
     if image is None:
         raise ValueError("Пустое изображение")
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if rotate_deg in (90, 180, 270):
+        code = {90: cv2.ROTATE_90_COUNTERCLOCKWISE,
+                180: cv2.ROTATE_180,
+                270: cv2.ROTATE_90_CLOCKWISE}[int(rotate_deg)]
+        image = cv2.rotate(image, code)
     result = image.copy()
-    info = {"perspective": False, "skew_angle": 0.0, "dewarp": None,
-            "enhanced": False, "steps": []}
+    info = {"perspective": False, "skew_angle": 0.0, "enhanced": False, "steps": []}
 
-    # 1. Ориентация: если кадр снят боком (текст вертикально) — повернуть
-    if do_skew:
-        result, oriented = _orient_upright(result)
-        if oriented:
-            info["steps"].append("кадр снят боком — повёрнут на 90 град.")
-
-    # 2. Перспектива и деформация: ищем границы документа
+    # 1. Перспектива и деформация: в кадре остаётся только лист
     if do_perspective:
-        quad = find_document_contour(result)
+        quad, why = find_document_contour(result)
         if quad is not None:
-            quad = _expand_quad(quad, 0.008)
+            quad = _expand_quad(quad, 0.014)
             result = four_point_transform(result, quad)
             info["perspective"] = True
-            info["steps"].append("границы найдены — перспектива и трапеция исправлены")
+            info["steps"].append("границы листа найдены, перспектива и деформация исправлены")
+        else:
+            info["steps"].append("перспектива: %s" % why)
 
-    # 3. Выравнивание по горизонтали и вертикали
+    # 2. Обрезка «только лист»: по маске (повёрнутый прямоугольник),
+    #    при неудаче — по профилям яркости. Светлые ряды листа не режутся,
+    #    поэтому контент не теряется. Делается ДО шумоподавления (денойз
+    #    сглаживает фактуру фона до «похожести на лист») и ДО выравнивания
+    #    наклона (кроп мог бы внести свой мелкий угол — строки текста
+    #    надёжнее доведут ориентацию последними).
+    before = result.shape[:2]
+    result, cropped, mfrac = crop_by_mask(result)
+    if cropped:
+        info["steps"].append("кадр обрезан по границам листа (маска, доля %.2f)" % mfrac)
+    else:
+        result, cuts = profile_crop(result)
+        if cuts["top"] or cuts["bottom"] or cuts["left"] or cuts["right"]:
+            info["steps"].append(
+                "лишний фон срезан (низ %d, верх %d, лево %d, право %d пикс.)"
+                % (cuts["bottom"], cuts["top"], cuts["left"], cuts["right"])
+            )
+
+    # 3. Наклон: выравнивание по горизонтали и вертикали (после кропа —
+    #    исправляет и собственный мелкий угол вписанного прямоугольника)
     rotated = False
     if do_skew:
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-        mask, _, _ = _text_mask(gray)
-        angle, conf = _projection_angle(mask)
-        if conf < 2.0:
-            angle, conf2 = _hough_median_angle(result)
-            if conf2 < 0.2:
-                angle = 0.0
-        if abs(angle) >= 0.1:
+        angle = detect_skew_angle(result)
+        if abs(angle) >= 0.25:
             result = rotate_bound(result, angle)
             rotated = True
             info["skew_angle"] = round(float(angle), 2)
             info["steps"].append(
-                "наклон %.2f град. исправлен — строки горизонтальны" % angle
+                "наклон %.1f град. исправлен — выровнено по горизонтали и вертикали" % angle
             )
+            # поворот размазывает кромочные полосы вдоль краёв — контрольный
+            # проход осевого кропа (без поворота!) снимает клинья и размазку
+            result, cropped2, _frac2 = crop_by_mask(result, axis_only=True)
+            if not cropped2:
+                result, _cuts2 = profile_crop(result)
 
-        # 3b. Построчное выпрямление: изгиб страницы, трапеция, вертикали
-        result, drep = dewarp_lines(result)
-        info["dewarp"] = drep
-        if drep["h"]:
-            rotated = True
-            info["steps"].append(
-                "изгиб строк выпрямлен (разброс %.1f -> %.1f град.)"
-                % (drep["spread_before"], drep["spread_after"])
-            )
-        if drep["trap"]:
-            rotated = True
-            info["steps"].append("трапеция/перспектива строк выпрямлена")
-        if drep["v"]:
-            rotated = True
-            info["steps"].append("вертикальные линии выровнены")
-
-        # 3c. контрольный остаточный наклон
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-        mask2, _, _ = _text_mask(gray)
-        ang2, conf2 = _projection_angle(mask2, max_angle=4.0)
-        if conf2 >= 2.0 and abs(ang2) >= 0.4:
-            result = rotate_bound(result, ang2)
-            rotated = True
-            info["skew_angle"] = round(float(ang2), 2)
-            info["steps"].append("остаточный наклон %.2f град. исправлен" % ang2)
-
-    # 4. Чёткость и качество: шумоподавление + однотонный фон
+    # 4. Шумоподавление (после обрезки — меньше площадь, быстрее и чище)
     if do_enhance:
-        result, den_ok = denoise(result, 5.0)
+        result, den_ok = denoise(result, 4.0)
+
+    # 5. Чёткость и качество: выравнивание света + однотонный фон
+    if do_enhance:
         result = balance_light(result)
         info["enhanced"] = True
 
-    # 5. Заливка фона белым от краёв: остатки стола, виньетка, клинья
-    if do_perspective or rotated:
+    # 6. Заливка фона белым от краёв: остатки стола, виньетка, клинья
+    if do_perspective or rotated or do_enhance:
         result = whiten_background(result)
-        if do_perspective or info.get("dewarp", {}).get("h"):
-            # мягкая чистка кромки: белым делаем только светлые пиксели
-            h, w = result.shape[:2]
-            gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-            border = np.zeros((h, w), bool)
-            border[:8, :] = True
-            border[-8:, :] = True
-            border[:, :8] = True
-            border[:, -8:] = True
-            result[border & (gray > 180)] = 255
+        h, w = result.shape[:2]
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+        border = np.zeros((h, w), bool)
+        border[:8, :] = True
+        border[-8:, :] = True
+        border[:, :8] = True
+        border[:, -8:] = True
+        result[border & (gray > 185)] = 255
 
-    # 6. Обрезка артефактов поворота (белые клинья по углам)
-    if rotated:
-        result = trim_white_margins(result)
+    # 7. Обрезка полностью пустых белых кромок (клинья поворота)
+    result = trim_white_margins(result)
 
-    # 7. Резкость — последней, чтобы не усиливать границы артефактов
+    # 8. Резкость — последней, чтобы не усиливать артефакты
     if do_enhance:
-        result = sharpen(result, 0.7)
-        info["steps"].append(
-            "качество: шум убран, фон однотонный, свет выровнен, резкость повышена"
-        )
+        result = sharpen(result, 0.5)
+        info["steps"].append("чёткость и качество: шум убран, свет выровнен, фон однотонно белый, резкость повышена")
 
     info["size"] = {"width": int(result.shape[1]), "height": int(result.shape[0])}
     return result, info
@@ -1050,7 +1193,7 @@ def process_image(image, do_perspective=True, do_skew=True, do_enhance=True):
 
 def process_file(in_path, out_path, **kwargs):
     """Обрабатывает файл и сохраняет результат. Возвращает словарь отчёта."""
-    image = cv2.imread(in_path, cv2.IMREAD_COLOR)
+    image = load_image_bgr(in_path)
     if image is None:
         raise ValueError("Не удалось прочитать файл: %s" % in_path)
     result, info = process_image(image, **kwargs)
